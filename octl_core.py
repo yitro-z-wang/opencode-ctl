@@ -41,7 +41,7 @@ CAP_MESSAGES = 64 * 1024 * 1024  # message fetch: embedded tool I/O can be large
 CAP_ERROR_BODY = 64 * 1024  # HTTP error detail body
 
 DEVELOPMENT_BASELINE_VERSION = (
-    os.environ.get("OPENCODE_MCP_BASELINE_VERSION") or "2.0.12"
+    os.environ.get("OCTL_BASELINE_VERSION") or "2.0.18"
 )
 
 # --- Subtree (subagent) resolution -----------------------------------------
