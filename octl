@@ -1,0 +1,1120 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""octl — agent-facing opencode CLI (opencode-ctl).
+
+One process per invocation. JSON goes to stdout, human logs go to stderr and the
+process exit code classifies the outcome (see ``EXIT_*``). It drives an
+operator-deployed ``opencode serve`` over HTTP using the shared, stdlib-only
+``octl_core`` domain library.
+
+Security invariants (DESIGN-opencode-ctl.zh-CN.md §2):
+
+* no credential material is ever written to stdout, stderr or a log line, under
+  any code path (success, error or debug);
+* endpoints are addressed by alias only — there is no URL parameter anywhere;
+* there is no session-listing verb and no endpoint registration verb.
+
+Requires Python >= 3.11 (``tomllib``), standard library only.
+"""
+
+import argparse
+import base64
+import json
+import os
+import sqlite3
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+
+# Make ``octl_core`` importable when this script is invoked by absolute path or
+# through a symlink; the repository root is the script's own directory.
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import tomllib  # noqa: E402  (Python >= 3.11)
+
+import octl_core as core  # noqa: E402
+from octl_core import (  # noqa: E402
+    DEVELOPMENT_BASELINE_VERSION,
+    Connection,
+    OpenCodeError,
+    VersionWarnings,
+    _attach_subtree,
+    _enrich_forms,
+    _format_message,
+    _form_summary,
+    _subtree_snapshot,
+    fetch_forms,
+    fetch_messages,
+    fetch_permissions,
+    http_request,
+    poll_once,
+    run_until_terminal,
+    unwrap,
+)
+
+OCTL_VERSION = "1.0.0"
+
+# --- Exit codes (DESIGN §5) -------------------------------------------------
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_AVAILABILITY = 3
+EXIT_COMPATIBILITY = 4
+EXIT_OTHER = 5
+EXIT_TIMEOUT = 6
+EXIT_NEEDS_PERMISSION = 7
+EXIT_NEEDS_FORM = 8
+
+_KIND_EXIT = {
+    "availability": EXIT_AVAILABILITY,
+    "compatibility": EXIT_COMPATIBILITY,
+    "other": EXIT_OTHER,
+}
+
+# status -> exit code, shared by the blocking wait and the --once snapshot.
+#   succeeded / running / in-progress -> 0
+#   failed / interrupted / compaction_failed -> 5 ([other])
+#   timeout -> 6, needs_permission -> 7, needs_form -> 8
+_STATUS_EXIT = {
+    None: EXIT_OK,
+    "running": EXIT_OK,
+    "succeeded": EXIT_OK,
+    "failed": EXIT_OTHER,
+    "interrupted": EXIT_OTHER,
+    "compaction_failed": EXIT_OTHER,
+    "cancelled": EXIT_OTHER,
+    "timeout": EXIT_TIMEOUT,
+    "needs_permission": EXIT_NEEDS_PERMISSION,
+    "needs_form": EXIT_NEEDS_FORM,
+}
+
+# compact has no --timeout flag (DESIGN §5: unlisted verbs take only -s SES),
+# so it uses this fixed budget.
+COMPACT_TIMEOUT_SECS = 300.0
+
+
+class UsageError(Exception):
+    """A CLI usage / configuration problem; maps to exit code 2."""
+
+
+# ---------------------------------------------------------------------------
+# Config (DESIGN §3)
+# ---------------------------------------------------------------------------
+
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(base, "octl", "endpoints.toml")
+
+
+def _looks_like_url(value):
+    value = (value or "").strip()
+    return "://" in value or value.lower().startswith("http")
+
+
+class Endpoint:
+    """One operator-configured opencode endpoint (a secret-bearing handle).
+
+    The password is resolved lazily so ``password_command`` only runs when the
+    endpoint is actually used. Errors never repeat argv/stdout/stderr — only the
+    alias — so a command line that inlines a secret cannot leak it back.
+    """
+
+    def __init__(self, alias, url, username="opencode", password=None,
+                 password_command=None, source="config"):
+        self.alias = alias
+        self.url = url
+        self.username = username or "opencode"
+        self.password = password
+        self.password_command = password_command
+        self.source = source
+
+    def resolve_password(self):
+        if self.password is not None:
+            return self.password
+        if not self.password_command:
+            return None
+        try:
+            proc = subprocess.run(
+                self.password_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            )
+        except Exception as exc:
+            raise UsageError(
+                "password_command failed for endpoint '%s' (%s)"
+                % (self.alias, type(exc).__name__)
+            )
+        if proc.returncode != 0:
+            raise UsageError(
+                "password_command failed for endpoint '%s' (exit %s)"
+                % (self.alias, proc.returncode)
+            )
+        line = ""
+        if proc.stdout:
+            text = proc.stdout.decode("utf-8", "replace")
+            line = text.splitlines()[0].strip() if text.splitlines() else ""
+        if not line:
+            raise UsageError(
+                "password_command for endpoint '%s' returned an empty first line"
+                % self.alias
+            )
+        return line
+
+    def connection(self):
+        return EndpointConnection(
+            self.alias,
+            self.url,
+            self.resolve_password(),
+            username=self.username,
+            is_local=False,
+            source=self.source,
+        )
+
+
+class EndpointConnection(Connection):
+    """A core Connection that honours the configured basic-auth username.
+
+    Core's ``Connection.auth_header`` pins the username to "opencode"; the CLI
+    keeps the configurable username without modifying core by overriding the
+    header builder.
+    """
+
+    def __init__(self, name, base_url, password, username="opencode",
+                 is_local=False, source="config"):
+        super().__init__(name, base_url, password, is_local=is_local, source=source)
+        self.username = username or "opencode"
+
+    def auth_header(self):
+        if not self.password:
+            return None
+        token = base64.b64encode(
+            (self.username + ":" + self.password).encode("utf-8")
+        ).decode("ascii")
+        return "Basic " + token
+
+
+def load_config(path=None):
+    """Parse ``endpoints.toml``; returns {"endpoints", "default", "path"}.
+
+    Never includes a password in any raised message — alias/url only.
+    """
+    path = path or config_path()
+    result = {"endpoints": {}, "default": None, "path": path}
+    if not os.path.exists(path):
+        return result
+
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o077:
+            sys.stderr.write(
+                "octl: warning: %s permissions %03o are looser than 0600 "
+                "(group/other can read the credentials); recommend chmod 600\n"
+                % (path, mode)
+            )
+    except OSError:
+        pass
+
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except Exception as exc:
+        raise UsageError("cannot read config %s: %s" % (path, type(exc).__name__))
+    if not isinstance(data, dict):
+        raise UsageError("config %s is not a TOML table" % path)
+
+    raw = data.get("endpoints", {})
+    if not isinstance(raw, dict):
+        raise UsageError("config %s: [endpoints] must be a table" % path)
+
+    endpoints = {}
+    for alias, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise UsageError("config: endpoint '%s' must be a TOML table" % alias)
+        url = entry.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise UsageError("config: endpoint '%s' is missing the required 'url'" % alias)
+        username = entry.get("username") or "opencode"
+        if not isinstance(username, str):
+            raise UsageError("config: endpoint '%s' username must be a string" % alias)
+        has_password = "password" in entry
+        has_command = "password_command" in entry
+        if has_password == has_command:
+            raise UsageError(
+                "config: endpoint '%s' must set exactly one of 'password' or "
+                "'password_command'" % alias
+            )
+        if has_password:
+            password = entry.get("password")
+            if not isinstance(password, str):
+                raise UsageError(
+                    "config: endpoint '%s' password must be a string" % alias
+                )
+            endpoints[alias] = Endpoint(alias, url, username, password=password)
+        else:
+            command = entry.get("password_command")
+            if (not isinstance(command, list) or not command
+                    or not all(isinstance(item, str) and item for item in command)):
+                raise UsageError(
+                    "config: endpoint '%s' password_command must be a non-empty "
+                    "argv array" % alias
+                )
+            endpoints[alias] = Endpoint(
+                alias, url, username, password_command=command
+            )
+
+    default = data.get("default")
+    if default is not None and default not in endpoints:
+        raise UsageError(
+            "config: default = %r does not name any [endpoints.*]" % default
+        )
+    result["endpoints"] = endpoints
+    result["default"] = default
+    return result
+
+
+def env_endpoint():
+    url = os.environ.get("OPENCODE_URL")
+    if not url:
+        return None
+    return Endpoint(
+        "env",
+        url,
+        "opencode",
+        password=os.environ.get("OPENCODE_PASSWORD") or None,
+        source="env",
+    )
+
+
+def config_endpoint(config, alias):
+    """Resolve an alias to an Endpoint. Aliases only — a URL is a usage error."""
+    if _looks_like_url(alias):
+        raise UsageError(
+            "--endpoint takes an endpoint ALIAS, not a URL: %r "
+            "(URLs live only in the operator config)" % alias
+        )
+    if alias == "env":
+        endpoint = env_endpoint()
+        if endpoint is None:
+            raise UsageError("endpoint 'env' requires OPENCODE_URL to be set")
+        return endpoint
+    endpoint = config["endpoints"].get(alias)
+    if endpoint is None:
+        raise UsageError("unknown endpoint alias %r (see `octl endpoints`)" % alias)
+    return endpoint
+
+
+# ---------------------------------------------------------------------------
+# Routes cache (DESIGN §5)
+# ---------------------------------------------------------------------------
+
+def routes_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    return os.path.join(base, "octl", "routes.db")
+
+
+def _open_routes():
+    path = routes_path()
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=5)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS routes ("
+        "ses TEXT PRIMARY KEY, "
+        "endpoint TEXT NOT NULL, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
+    conn.commit()
+    return conn
+
+
+def record_route(session_id, endpoint_name, strict=False):
+    """Best-effort insert. strict=True raises UsageError instead of warning."""
+    if not session_id:
+        return
+    try:
+        conn = _open_routes()
+        try:
+            conn.execute(
+                "INSERT INTO routes (ses, endpoint) VALUES (?, ?) "
+                "ON CONFLICT(ses) DO UPDATE SET endpoint=excluded.endpoint",
+                (session_id, endpoint_name),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        message = (
+            "could not record the session route (%s); later commands need "
+            "--endpoint" % type(exc).__name__
+        )
+        if strict:
+            raise UsageError(message)
+        sys.stderr.write("octl: warning: %s\n" % message)
+
+
+def lookup_route(session_id):
+    """Return the endpoint name for a session, or None when unknown.
+
+    A corrupt/locked database is reported cleanly (never a traceback) with the
+    same remedy as a miss: pass --endpoint.
+    """
+    try:
+        conn = _open_routes()
+        try:
+            row = conn.execute(
+                "SELECT endpoint FROM routes WHERE ses = ?", (session_id,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise UsageError(
+            "routes database unavailable (%s); pass --endpoint" % type(exc).__name__
+        )
+
+
+def forget_route(session_id):
+    try:
+        conn = _open_routes()
+        try:
+            conn.execute("DELETE FROM routes WHERE ses = ?", (session_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _cli_route_session(session_id, conn):
+    """Registered with core: persist sessions recovered from a subtree walk."""
+    record_route(session_id, conn.name)
+
+
+core.set_route_session(_cli_route_session)
+
+
+# ---------------------------------------------------------------------------
+# Endpoint resolution
+# ---------------------------------------------------------------------------
+
+def resolve_endpoint(args, config, session_id=None):
+    """Resolve the endpoint for a command.
+
+    Order: explicit ``--endpoint`` -> routes.db lookup (session-addressed verbs)
+    -> config default -> OPENCODE_URL/OPENCODE_PASSWORD env.
+    """
+    alias = getattr(args, "endpoint", None)
+    if alias and _looks_like_url(alias):
+        raise UsageError(
+            "--endpoint takes an endpoint ALIAS, not a URL: %r" % alias
+        )
+    if session_id is not None and not alias:
+        alias = lookup_route(session_id)
+        if alias is None:
+            raise UsageError(
+                "unknown session %s; pass --endpoint" % session_id
+            )
+    if alias:
+        return config_endpoint(config, alias)
+    if config["default"]:
+        return config_endpoint(config, config["default"])
+    endpoint = env_endpoint()
+    if endpoint is not None:
+        return endpoint
+    raise UsageError(
+        "no endpoint configured; set `default` in %s or OPENCODE_URL" % config["path"]
+    )
+
+
+def doctor_endpoints(config, endpoint_arg):
+    if endpoint_arg:
+        return [config_endpoint(config, endpoint_arg)]
+    endpoints = [config["endpoints"][alias] for alias in sorted(config["endpoints"])]
+    if not endpoints:
+        endpoint = env_endpoint()
+        if endpoint is not None:
+            endpoints = [endpoint]
+    if not endpoints:
+        raise UsageError(
+            "no endpoints configured; create %s" % config["path"]
+        )
+    return endpoints
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    sys.stdout.flush()
+
+
+def maybe_warn(conn, payload):
+    """Attach a per-invocation baseline-mismatch warning when the version is known.
+
+    A fresh ``VersionWarnings`` is used (no cross-invocation or global state);
+    regular commands trust the config and do not probe, so this only fires once
+    the version has been learned within the invocation (probe or failure).
+    """
+    if not isinstance(payload, dict):
+        return payload
+    warning = VersionWarnings().warning_for(conn)
+    if not warning:
+        return payload
+    payload = dict(payload)
+    payload["api_version_warning"] = warning
+    return payload
+
+
+def exit_for_status(status):
+    return _STATUS_EXIT.get(status, EXIT_OTHER)
+
+
+def _read_stdin():
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return ""
+    except Exception:
+        return ""
+    try:
+        return sys.stdin.read()
+    except Exception:
+        return ""
+
+
+def read_stdin_json(required=False, label="stdin"):
+    raw = _read_stdin()
+    if not raw.strip():
+        if required:
+            raise UsageError("expected a JSON object on %s" % label)
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise UsageError("invalid JSON on %s: %s" % (label, exc))
+
+
+# ---------------------------------------------------------------------------
+# Probing (doctor / endpoints --check)
+# ---------------------------------------------------------------------------
+
+def probe_endpoint(endpoint):
+    """Probe one endpoint. Returns (row, kind) with kind None on success."""
+    conn = endpoint.connection()
+    row = {
+        "name": endpoint.alias,
+        "url": endpoint.url,
+        "reachable": False,
+        "auth_ok": None,
+        "version": None,
+        "baseline": DEVELOPMENT_BASELINE_VERSION,
+        "baseline_check": "unknown",
+        "detail": None,
+    }
+    try:
+        info = core._raw_probe(conn)
+    except urllib.error.HTTPError as exc:
+        row["reachable"] = True
+        if exc.code in (401, 403):
+            row["auth_ok"] = False
+            row["detail"] = "authentication rejected (HTTP %s)" % exc.code
+            return row, "availability"
+        row["auth_ok"] = True
+        row["detail"] = "/api/info returned HTTP %s (not the opencode API)" % exc.code
+        return row, "compatibility"
+    except ValueError:
+        row["reachable"] = True
+        row["auth_ok"] = True
+        row["detail"] = "/api/info did not return opencode v2 API JSON"
+        return row, "compatibility"
+    except OpenCodeError as exc:
+        row["detail"] = str(exc)
+        return row, exc.kind
+    except Exception as exc:
+        row["detail"] = "cannot connect: %s" % type(exc).__name__
+        return row, "availability"
+
+    row["reachable"] = True
+    row["auth_ok"] = True
+    if not isinstance(info, dict) or not isinstance(info.get("version"), str):
+        row["detail"] = "/api/info has no version field; the API looks reworked"
+        return row, "compatibility"
+    conn.server_version = info["version"]
+    row["version"] = info["version"]
+    row["baseline_check"] = conn.describe()["baseline_check"]
+    return row, None
+
+
+# ---------------------------------------------------------------------------
+# Verbs
+# ---------------------------------------------------------------------------
+
+def cmd_doctor(args, config):
+    rows = []
+    kinds = []
+    for endpoint in doctor_endpoints(config, getattr(args, "endpoint", None)):
+        row, kind = probe_endpoint(endpoint)
+        rows.append(row)
+        if kind:
+            kinds.append(kind)
+    emit({"endpoints": rows, "ok": not kinds})
+    return _exit_for_kinds(kinds)
+
+
+def cmd_endpoints(args, config):
+    rows = []
+    kinds = []
+    aliases = sorted(config["endpoints"])
+    checked = bool(getattr(args, "check", False))
+    for alias in aliases:
+        endpoint = config["endpoints"][alias]
+        row = {
+            "name": alias,
+            "url": endpoint.url,
+            "default": alias == config["default"],
+            "username": endpoint.username,
+            "password_source": (
+                "password_command" if endpoint.password_command
+                else "password" if endpoint.password is not None
+                else "none"
+            ),
+        }
+        if checked:
+            probed, kind = probe_endpoint(endpoint)
+            row.update({
+                "reachable": probed["reachable"],
+                "auth_ok": probed["auth_ok"],
+                "version": probed["version"],
+                "baseline": probed["baseline"],
+                "baseline_check": probed["baseline_check"],
+            })
+            if probed.get("detail"):
+                row["detail"] = probed["detail"]
+            if kind:
+                kinds.append(kind)
+        rows.append(row)
+    emit({"endpoints": rows, "count": len(rows)})
+    if checked:
+        return _exit_for_kinds(kinds)
+    return EXIT_OK
+
+
+def cmd_agents(args, config):
+    # Re-implemented minimally here: the only copy lives in server.py, which is
+    # scheduled for deletion in Phase 4 and is not imported by the CLI.
+    endpoint = resolve_endpoint(args, config)
+    conn = endpoint.connection()
+    data = unwrap(http_request(conn, "GET", "/api/agent"))
+    if not isinstance(data, list):
+        data = []
+    agents = []
+    for agent in data:
+        if not isinstance(agent, dict):
+            continue
+        agents.append({
+            "name": agent.get("name"),
+            "mode": agent.get("mode"),
+            "model": agent.get("model"),
+        })
+    payload = {
+        "server": conn.name,
+        "count": len(agents),
+        "agents": agents,
+        "note": "model being null means the agent has no explicitly configured "
+                "model (it falls back to the position default model at runtime).",
+    }
+    emit(maybe_warn(conn, payload))
+    return EXIT_OK
+
+
+def cmd_create(args, config):
+    endpoint = resolve_endpoint(args, config)
+    conn = endpoint.connection()
+    directory = os.path.abspath(args.directory) if args.directory else os.path.abspath(os.getcwd())
+    body = {"location": {"directory": directory}}
+    if args.title:
+        body["title"] = args.title
+    if args.agent:
+        body["agent"] = args.agent
+    data = unwrap(http_request(conn, "POST", "/api/session", body=body))
+    if not isinstance(data, dict):
+        data = {}
+    session_id = data.get("id")
+    if not session_id:
+        raise OpenCodeError("[other] create session returned no id")
+    record_route(session_id, conn.name)
+    payload = {
+        "session_id": session_id,
+        "server": conn.name,
+        "title": data.get("title"),
+        "agent": data.get("agent"),
+        "model": data.get("model"),
+        "location": {"directory": directory},
+    }
+    emit(maybe_warn(conn, payload))
+    return EXIT_OK
+
+
+def cmd_chat(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    stdin_obj = read_stdin_json()
+    if isinstance(stdin_obj, dict) and "text" in stdin_obj:
+        text = stdin_obj["text"]  # stdin wins when both are given
+    elif args.text is not None:
+        text = args.text
+    else:
+        raise UsageError('missing prompt text; pass --text or JSON {"text": ...} on stdin')
+    if not isinstance(text, str) or not text:
+        raise UsageError("prompt text must be a non-empty string")
+    payload = unwrap(http_request(
+        conn,
+        "POST",
+        "/api/session/%s/prompt" % urllib.parse.quote(session_id, safe=""),
+        body={"text": text},
+    ))
+    gate_id = payload.get("id") if isinstance(payload, dict) else None
+    record_route(session_id, conn.name)
+    emit(maybe_warn(conn, {
+        "status": "submitted",
+        "server": conn.name,
+        "session_id": session_id,
+        "message_id": gate_id,
+    }))
+    return EXIT_OK
+
+
+def _once_payload(conn, session_id, snapshot):
+    if snapshot.get("payload") is not None:
+        payload = dict(snapshot["payload"])
+        payload["status"] = snapshot["status"]
+        return payload
+    try:
+        messages = fetch_messages(conn, session_id)
+    except OpenCodeError:
+        messages = []
+    payload = {
+        "status": "running",
+        "server": conn.name,
+        "session_id": session_id,
+        "outcome": snapshot.get("outcome"),
+        "last_message_id": messages[-1].get("id") if messages else None,
+        "pending_permissions": len(snapshot.get("permissions") or []),
+        "pending_forms": len(snapshot.get("forms") or []),
+    }
+    if snapshot.get("subtree") is not None:
+        _attach_subtree(payload, snapshot["subtree"])
+    return payload
+
+
+def cmd_wait(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    record_route(session_id, conn.name)
+    if args.once:
+        snapshot = poll_once(
+            conn,
+            session_id,
+            auto_permission="manual",
+            with_result=True,
+            wait_for_subagents=True,
+        )
+        payload = _once_payload(conn, session_id, snapshot)
+        emit(maybe_warn(conn, payload))
+        return exit_for_status(payload.get("status"))
+    status, payload = run_until_terminal(
+        conn,
+        session_id,
+        args.timeout,
+        auto_permission="manual",
+        with_result=True,
+        wait_for_subagents=True,
+        cancel_check=None,
+    )
+    emit(maybe_warn(conn, payload))
+    return exit_for_status(status)
+
+
+def cmd_messages(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    limit = max(1, int(args.limit))
+    note = None
+    if args.after:
+        messages = fetch_messages(conn, session_id, limit=200)
+        index = next(
+            (i for i, m in enumerate(messages) if m.get("id") == args.after), -1
+        )
+        if index >= 0:
+            messages = messages[index + 1:]
+        else:
+            note = ("after cursor is not among the latest 200 messages; "
+                    "returned the full list instead.")
+        if len(messages) > limit:
+            messages = messages[-limit:]
+    else:
+        messages = fetch_messages(conn, session_id, limit=limit)
+    messages = sorted(
+        messages, key=lambda m: (m.get("time") or {}).get("created") or 0
+    )
+    formatted = [_format_message(m) for m in messages]
+    payload = {
+        "server": conn.name,
+        "session_id": session_id,
+        "count": len(formatted),
+        "messages": formatted,
+        "last_message_id": messages[-1].get("id") if messages else None,
+    }
+    if note:
+        payload["note"] = note
+    emit(maybe_warn(conn, payload))
+    return EXIT_OK
+
+
+def cmd_permission_reply(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    body = {"decision": args.decision}
+    if args.message:
+        body["message"] = args.message
+    http_request(
+        conn,
+        "POST",
+        "/api/session/%s/permission/%s/reply"
+        % (urllib.parse.quote(session_id, safe=""),
+           urllib.parse.quote(args.request_id, safe="")),
+        body=body,
+    )
+    emit(maybe_warn(conn, {
+        "ok": True,
+        "server": conn.name,
+        "session_id": session_id,
+        "request_id": args.request_id,
+        "decision": args.decision,
+    }))
+    return EXIT_OK
+
+
+def cmd_form_reply(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    answer = read_stdin_json(required=True, label="stdin")
+    if not isinstance(answer, dict):
+        raise UsageError('form answers must be a JSON object on stdin, e.g. {"field": value}')
+    http_request(
+        conn,
+        "POST",
+        "/api/session/%s/form/%s/reply"
+        % (urllib.parse.quote(session_id, safe=""),
+           urllib.parse.quote(args.form_id, safe="")),
+        body={"answer": answer},
+    )
+    emit(maybe_warn(conn, {
+        "ok": True,
+        "server": conn.name,
+        "session_id": session_id,
+        "form_id": args.form_id,
+        "answer": answer,
+    }))
+    return EXIT_OK
+
+
+def _with_owner(items, session_id):
+    out = []
+    for item in items:
+        if isinstance(item, dict) and not item.get("sessionID"):
+            item = dict(item, sessionID=session_id)
+        out.append(item)
+    return out
+
+
+def cmd_pending(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    record_route(session_id, conn.name)
+    snapshot = _subtree_snapshot(conn, session_id)
+    if snapshot["verified"]:
+        permissions = snapshot["permissions"]
+        forms = [_form_summary(f) for f in _enrich_forms(conn, snapshot["forms"])]
+    else:
+        permissions = _with_owner(fetch_permissions(conn, session_id), session_id)
+        forms = [
+            _form_summary(f)
+            for f in fetch_forms(conn, session_id, pending_only=True)
+        ]
+    payload = {
+        "server": conn.name,
+        "session_id": session_id,
+        "root_session_id": session_id,
+        "permissions": permissions,
+        "forms": forms,
+    }
+    _attach_subtree(payload, snapshot)
+    emit(maybe_warn(conn, payload))
+    return EXIT_OK
+
+
+def cmd_interrupt(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    http_request(
+        conn, "POST",
+        "/api/session/%s/interrupt" % urllib.parse.quote(session_id, safe=""),
+    )
+    emit(maybe_warn(conn, {"ok": True, "server": conn.name, "session_id": session_id}))
+    return EXIT_OK
+
+
+def cmd_context(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    data = unwrap(http_request(
+        conn, "GET",
+        "/api/session/%s" % urllib.parse.quote(session_id, safe=""),
+    ))
+    if not isinstance(data, dict):
+        data = {}
+    payload = {
+        "server": conn.name,
+        "id": data.get("id"),
+        "title": data.get("title"),
+        "agent": data.get("agent"),
+        "model": data.get("model"),
+        "parentID": data.get("parentID"),
+        "tokens": data.get("tokens"),
+        "cost": data.get("cost"),
+        "time": {
+            "updated": (data.get("time") or {}).get("updated"),
+            "idle": (data.get("time") or {}).get("idle"),
+        },
+        "revert": data.get("revert"),
+    }
+    emit(maybe_warn(conn, payload))
+    return EXIT_OK
+
+
+def cmd_compact(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    record_route(session_id, conn.name)
+    baseline = set(m.get("id") for m in fetch_messages(conn, session_id))
+    compact_payload = http_request(
+        conn, "POST",
+        "/api/session/%s/compact" % urllib.parse.quote(session_id, safe=""),
+        body={},
+    )
+    gate_id = (
+        compact_payload.get("data", {}).get("id")
+        if isinstance(compact_payload, dict) else None
+    )
+    status, payload = run_until_terminal(
+        conn,
+        session_id,
+        COMPACT_TIMEOUT_SECS,
+        auto_permission="manual",
+        gate_message_id=gate_id,
+        gate_is_compaction=True,
+        baseline=baseline,
+        with_result=True,
+        cancel_check=None,
+    )
+    emit(maybe_warn(conn, payload))
+    return exit_for_status(status)
+
+
+def cmd_delete(args, config):
+    session_id = args.session
+    endpoint = resolve_endpoint(args, config, session_id=session_id)
+    conn = endpoint.connection()
+    http_request(
+        conn, "DELETE",
+        "/api/session/%s" % urllib.parse.quote(session_id, safe=""),
+    )
+    forget_route(session_id)
+    emit(maybe_warn(conn, {"ok": True, "server": conn.name, "session_id": session_id}))
+    return EXIT_OK
+
+
+def _exit_for_kinds(kinds):
+    if "availability" in kinds:
+        return EXIT_AVAILABILITY
+    if "compatibility" in kinds:
+        return EXIT_COMPATIBILITY
+    return EXIT_OK
+
+
+COMMANDS = {
+    "doctor": cmd_doctor,
+    "endpoints": cmd_endpoints,
+    "agents": cmd_agents,
+    "create": cmd_create,
+    "chat": cmd_chat,
+    "wait": cmd_wait,
+    "messages": cmd_messages,
+    "permission-reply": cmd_permission_reply,
+    "form-reply": cmd_form_reply,
+    "pending": cmd_pending,
+    "interrupt": cmd_interrupt,
+    "compact": cmd_compact,
+    "context": cmd_context,
+    "delete": cmd_delete,
+}
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+WAIT_EPILOG = """\
+exit codes for `wait`:
+  0  succeeded (or --once while the session is still running: status=running)
+  5  failed / interrupted / compaction_failed
+  6  timeout (JSON carries partial state and diagnostics)
+  7  needs_permission (JSON carries the full request details)
+  8  needs_form (JSON carries the form summaries)
+
+`--once` performs a single poll snapshot and returns immediately; the caller
+owns the polling loop. `--timeout` is ignored with `--once`.
+"""
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--endpoint", metavar="ALIAS",
+        default=argparse.SUPPRESS,
+        help="endpoint alias from endpoints.toml (aliases only; never a URL)",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="octl",
+        description="Agent-facing opencode CLI. JSON on stdout, logs on stderr.",
+    )
+    parser.add_argument("--version", action="version", version="octl " + OCTL_VERSION)
+    parser.add_argument(
+        "--endpoint", metavar="ALIAS", default=None,
+        help="endpoint alias from endpoints.toml (aliases only; never a URL)",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="VERB")
+
+    sub.add_parser("doctor", parents=[common], help="reachability/auth/version check per endpoint")
+
+    p_endpoints = sub.add_parser("endpoints", parents=[common],
+                                 help="list configured endpoint aliases")
+    p_endpoints.add_argument("--check", action="store_true",
+                             help="also probe each endpoint (auth + version)")
+
+    sub.add_parser("agents", parents=[common], help="list agents and their configured models")
+
+    p_create = sub.add_parser("create", parents=[common], help="create a session")
+    p_create.add_argument("--directory", help="absolute (or cwd-relative) working directory")
+    p_create.add_argument("--title", help="session title")
+    p_create.add_argument("--agent", help="agent name")
+
+    p_chat = sub.add_parser("chat", parents=[common],
+                            help="submit a prompt (async; returns immediately)")
+    p_chat.add_argument("-s", "--session", required=True, metavar="SES")
+    p_chat.add_argument("--text", help='prompt text (or {"text": ...} on stdin; stdin wins)')
+
+    p_wait = sub.add_parser("wait", parents=[common],
+                            help="wait for terminal/needs-interaction state",
+                            epilog=WAIT_EPILOG,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_wait.add_argument("-s", "--session", required=True, metavar="SES")
+    p_wait.add_argument("--timeout", type=float, default=300.0, metavar="SECONDS",
+                        help="blocking wait budget in seconds (default 300)")
+    p_wait.add_argument("--once", action="store_true",
+                        help="single poll snapshot instead of blocking")
+
+    p_messages = sub.add_parser("messages", parents=[common],
+                                help="fetch session messages (incremental cursor)")
+    p_messages.add_argument("-s", "--session", required=True, metavar="SES")
+    p_messages.add_argument("--after", metavar="CURSOR", help="only messages after this id")
+    p_messages.add_argument("--limit", type=int, default=50, metavar="N",
+                            help="maximum messages (default 50)")
+
+    p_perm = sub.add_parser("permission-reply", parents=[common],
+                            help="answer a permission request")
+    p_perm.add_argument("-s", "--session", required=True, metavar="SES")
+    p_perm.add_argument("--request-id", required=True, metavar="RID")
+    p_perm.add_argument("--decision", required=True, choices=["once", "always", "reject"])
+    p_perm.add_argument("--message", help="optional attached note")
+
+    p_form = sub.add_parser("form-reply", parents=[common],
+                            help="answer a form (JSON answers on stdin)")
+    p_form.add_argument("-s", "--session", required=True, metavar="SES")
+    p_form.add_argument("--form-id", required=True, metavar="FID")
+
+    p_pending = sub.add_parser("pending", parents=[common],
+                               help="subtree-scoped pending permissions and forms")
+    p_pending.add_argument("-s", "--session", required=True, metavar="SES")
+
+    p_interrupt = sub.add_parser("interrupt", parents=[common],
+                                 help="interrupt generation in a session")
+    p_interrupt.add_argument("-s", "--session", required=True, metavar="SES")
+
+    p_compact = sub.add_parser("compact", parents=[common], help="compact a session context")
+    p_compact.add_argument("-s", "--session", required=True, metavar="SES")
+
+    p_context = sub.add_parser("context", parents=[common],
+                               help="session context usage and metadata")
+    p_context.add_argument("-s", "--session", required=True, metavar="SES")
+
+    p_delete = sub.add_parser("delete", parents=[common], help="delete a session")
+    p_delete.add_argument("-s", "--session", required=True, metavar="SES")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "command", None) is None:
+        parser.print_help(sys.stderr)
+        return EXIT_USAGE
+    try:
+        config = load_config()
+        return COMMANDS[args.command](args, config)
+    except UsageError as exc:
+        sys.stderr.write("octl: %s\n" % exc)
+        return EXIT_USAGE
+    except OpenCodeError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return _KIND_EXIT.get(exc.kind, EXIT_OTHER)
+    except KeyboardInterrupt:
+        sys.stderr.write("octl: interrupted\n")
+        return EXIT_OTHER
+    except BrokenPipeError:
+        return EXIT_OK
+    except Exception as exc:
+        sys.stderr.write(
+            "octl: unexpected error: %s: %s\n" % (type(exc).__name__, exc)
+        )
+        return EXIT_OTHER
+
+
+if __name__ == "__main__":
+    sys.exit(main())

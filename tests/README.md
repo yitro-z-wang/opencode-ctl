@@ -2,10 +2,11 @@
 
 **English** | [中文](README.zh-CN.md)
 
-Live, end-to-end suites for `server.py`. They spawn the real MCP over stdio,
-talk to a real `opencode` server and exercise the connection layer, the
+Live, end-to-end suites for `server.py` (the MCP) and `octl` (the CLI). The
+MCP suites spawn the real MCP over stdio and exercise the connection layer, the
 permission/form loops, the subagent subtree semantics and the spawned-serve
-lifecycle.
+lifecycle. The CLI suites exercise the `octl` contract offline and against a
+real `opencode serve`.
 
 ## Prerequisites
 
@@ -25,6 +26,8 @@ Each suite is standalone and prints one line per scenario plus a summary line:
 python3 tests/live_core_test.py
 python3 tests/live_subagent_test.py
 python3 tests/live_lifecycle_test.py
+python3 tests/cli_offline_test.py
+python3 tests/live_cli_test.py
 ```
 
 The process exit code is `1` only when at least one scenario **fails**. Skips
@@ -99,6 +102,27 @@ With a clean environment the MCP spawns its own `serve`. The suite forces that
 path via `list_servers`, locates the child process and asserts it is gone within
 a few seconds for each shutdown path: stdin EOF, `SIGTERM` and `SIGINT`. The
 whole suite reports SKIP when `opencode` is not on `PATH`.
+
+### `cli_offline_test.py`
+
+The offline suite for the `octl` CLI (Phase 2 of the opencode-ctl refactor).
+No external network: it exercises config parsing (`endpoints.toml`, both
+`password` and `password_command`, plus the loose-permissions warning), the
+routes database (write / lookup / miss), URL-as-alias rejection, the
+`OpenCodeError` kind -> exit-code mapping (monkeypatched), stdin JSON argument
+handling for `chat` / `form-reply`, and the credential non-leak invariant
+(wrong password and a failing `password_command`) against a throwaway HTTP
+server bound to `127.0.0.1`.
+
+### `live_cli_test.py`
+
+The harness (not `octl`) spawns `opencode serve` on a free port with a random
+`OPENCODE_SERVER_PASSWORD`, waits for readiness and writes a temporary
+`endpoints.toml` into a throwaway `XDG_CONFIG_HOME`, then drives the normal
+agent loop: `doctor` -> `create` -> `chat` (async) -> `wait` -> `messages
+--after` -> `delete`. Each step asserts the exit code and JSON keys and that the
+server password never leaks into stdout+stderr; `api_version_warning` is
+tolerated when present. Reports SKIP when `opencode` is not on `PATH`.
 
 ## Skip behaviour
 
