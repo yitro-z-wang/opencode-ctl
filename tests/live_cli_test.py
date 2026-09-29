@@ -203,6 +203,29 @@ def run(reporter, harness):
         and harness.session_id.startswith("ses_"),
         "rc=%s session_id=%s" % (create.returncode, harness.session_id),
     )
+
+    trust_create = harness.run([
+        "--endpoint", "local", "create", "--title", "live-trust",
+        "--directory", harness.project, "--trust", "/tmp/opencode/octl-*",
+    ])
+    trust_payload = parse_json(trust_create)
+    trust_session_id = (trust_payload or {}).get("session_id")
+    reporter.check(
+        "create --trust: serve accepts the permission ruleset",
+        trust_create.returncode == 0
+        and isinstance(trust_session_id, str)
+        and trust_session_id.startswith("ses_"),
+        "rc=%s session_id=%s" % (trust_create.returncode, trust_session_id),
+    )
+    if trust_session_id:
+        trust_delete = harness.run(["delete", "-s", trust_session_id])
+        reporter.check(
+            "create --trust: the trusted session deletes",
+            trust_delete.returncode == 0
+            and (parse_json(trust_delete) or {}).get("ok") is True,
+            "rc=%s" % trust_delete.returncode,
+        )
+
     if not harness.session_id:
         return
 

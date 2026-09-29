@@ -90,6 +90,9 @@ The `status` field is also always present in the JSON.
   operator's config.
 - **No session enumeration** — there is no `list` verb. Pending-interaction queries are scoped to a
   session subtree and fail closed (empty set) when verification is not possible.
+- **Operator pre-trust:** operators can additionally pre-trust paths/commands globally through
+  opencode's own permission configuration (`permissions` rules in `opencode.json`) — see
+  <https://opencode.ai/v2/docs/permissions>.
 - **Out of scope:** a malicious agent running as the same user can read the config and opencode
   state directly. That is the host's permission-gating responsibility, not something the CLI layer
   can backstop.

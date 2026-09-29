@@ -16,6 +16,7 @@ JSON 走 **stdout**，人读日志走 **stderr**，**退出码**即结果类别�
 **b. 开始一轮。**
 ```
 octl create                      # 从项目目录运行；或：octl create --directory /绝对路径
+octl create --trust "/tmp/opencode/*"   # 仅为本会话预信任 scratch 路径
 # -> JSON，包含 ses_... 会话 id
 octl chat -s ses_... --text "你的指令"   # 异步：入队即返回，不阻塞
 octl wait -s ses_...                # 阻塞，最长到 --timeout（缺省 300s）
@@ -65,7 +66,7 @@ octl messages -s ses_... --after <last_message_id>
 | `doctor` | 会话首步硬门禁：可达性、`/api/info` v2 形状、认证、版本基准。 |
 | `endpoints` | 枚举端点别名＋URL＋版本基准状态（不探活）；`--check` 追加逐端点探活、认证校验与基准。 |
 | `agents` | 列出 agent 及其解析后的默认模型（只读）。 |
-| `create` | 创建会话；以 cwd 作为 location，`--directory` 可覆盖。返回 `ses_` id。 |
+| `create` | 创建会话；以 cwd 作为 location，`--directory` 可覆盖。`--trust PATTERN`（可重复）为本会话预授权路径。返回 `ses_` id。 |
 | `chat` | 异步入队一条提示并返回（不阻塞）。 |
 | `wait` | 等待终态或需交互状态；`--timeout` 缺省 300s；`--once` = 单次快照＋游标。 |
 | `messages` | 拉取消息；`--after <id>` 只返回新输出及下一个游标。 |
@@ -84,6 +85,8 @@ octl messages -s ses_... --after <last_message_id>
   后续命令按 `ses_` id 自动解析端点；未命中时显式传 `--endpoint`。
 - **pending 是子树作用域：** 子 agent 的权限/表单会上报给父会话控制者，其载荷携带请求的真实
   属主 `sessionID`。回应时用该 sessionID，而不一定是父会话的。
+- **预信任 scratch 目录：** `create --trust PATTERN`（可重复）仅为本会话预授权资源——caller 声明、
+  会话作用域、随会话消亡——例如 `/tmp/opencode/*`，以避免权限轮次。
 - **端点为操作者配置：** 只用别名——绝不用 URL 或密码。
 - **interrupt** 取消运行中的任务（例如超时后）；**compact** 在上下文接近上限时裁剪；
   **context** 在压缩前查看 tokens/cost；**delete** 删除会话及其全部子会话。

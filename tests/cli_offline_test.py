@@ -11,8 +11,10 @@ logic or talks to a throwaway HTTP server bound to ``127.0.0.1`` that fakes the
 handful of opencode v2 API responses the CLI needs. The scenarios cover config
 parsing (TOML, ``password_command``, loose-permission warning), the routes
 database (write / lookup / miss), URL-as-alias rejection, the ``OpenCodeError``
-kind -> exit-code mapping (monkeypatched), stdin JSON argument handling and the
-credential non-leak invariant in a wrong-password run.
+kind -> exit-code mapping (monkeypatched), stdin JSON argument handling, the
+create permission pre-trust surface (``--trust`` expansion, stdin merge order,
+omission when unused) and the credential non-leak invariant in a wrong-password
+run.
 
 Each scenario prints PASS/FAIL; the process exits 1 when any scenario fails.
 See ``tests/README.md``.
@@ -467,6 +469,68 @@ def scenario_stdin_json(reporter):
         box.close()
 
 
+def scenario_create_permissions(reporter):
+    box = Sandbox()
+    server = FakeOpenCode(password="createpw")
+    try:
+        box.write_config(
+            'default = "main"\n'
+            '[endpoints.main]\n'
+            'url = "%s"\n'
+            'password = "createpw"\n'
+            % server.url
+        )
+
+        def create_body():
+            item = server.last("POST", suffix="/api/session")
+            body = (item or {}).get("body")
+            return body if isinstance(body, dict) else {}
+
+        # (a) --trust expands to exactly the three allow rules, in order.
+        trusted = box.run(["create", "--title", "t", "--trust", "/tmp/x/*"])
+        reporter.check(
+            "create --trust sends the three-rule expansion",
+            trusted.returncode == 0
+            and create_body().get("permissions") == [
+                {"action": "external_directory", "resource": "/tmp/x/*", "effect": "allow"},
+                {"action": "read", "resource": "/tmp/x/*", "effect": "allow"},
+                {"action": "edit", "resource": "/tmp/x/*", "effect": "allow"},
+            ],
+            "rc=%s body=%s" % (trusted.returncode, json.dumps(create_body())),
+        )
+
+        # (b) stdin permissions first, then the --trust expansions appended after.
+        stdin_rules = [
+            {"action": "read", "resource": "/tmp/y", "effect": "deny"},
+            {"action": "shell", "resource": "*", "effect": "ask"},
+        ]
+        merged = box.run(
+            ["create", "--title", "m", "--trust", "/tmp/y"],
+            stdin=json.dumps({"permissions": stdin_rules}),
+        )
+        reporter.check(
+            "create merges stdin permissions before --trust rules",
+            merged.returncode == 0
+            and create_body().get("permissions") == stdin_rules + [
+                {"action": "external_directory", "resource": "/tmp/y", "effect": "allow"},
+                {"action": "read", "resource": "/tmp/y", "effect": "allow"},
+                {"action": "edit", "resource": "/tmp/y", "effect": "allow"},
+            ],
+            "rc=%s body=%s" % (merged.returncode, json.dumps(create_body())),
+        )
+
+        # (c) neither given -> no permissions key in the request body at all.
+        plain = box.run(["create", "--title", "p"])
+        reporter.check(
+            "create omits the permissions key when neither is given",
+            plain.returncode == 0 and "permissions" not in create_body(),
+            "rc=%s body=%s" % (plain.returncode, json.dumps(create_body())),
+        )
+    finally:
+        server.close()
+        box.close()
+
+
 def scenario_credential_non_leak(reporter):
     name = "credentials never appear in output (wrong password + failing command)"
     box = Sandbox()
@@ -513,6 +577,7 @@ SCENARIOS = [
     scenario_url_as_alias,
     scenario_exit_code_mapping,
     scenario_stdin_json,
+    scenario_create_permissions,
     scenario_credential_non_leak,
 ]
 

@@ -118,7 +118,7 @@ CLI 面仅有:`endpoints`(枚举别名+URL+版本基准状态,不探活)、`endp
 - **`wait`**:`--timeout` 缺省 **300s**(阻塞长轮询,单进程内循环);`--once` = 单次快照+游标(agent 自管循环模式);**只有 manual 权限模式,不存在任何自动代答**——权限必须由 agent 审批。skills 明确指引:对安全请求回应 `always` 以减少轮次;
 - **`pending` / `pending` 类查询**:子树作用域(`parentID` 树 idset 精确成员过滤,子 agent 请求上报给父会话控制者,payload 带真实属主 `sessionID`);全局端点不可用回退逐会话端点;再不行 `verified=false` 空集失败关闭;
 - **`permission-reply` / `form-reply`**:会话内寻址(`/api/session/{sid}/permission/{rid}/reply` 路径本身绑定会话);
-- **预信任路径**(减少权限轮次的正道):实施完成后探索 opencode 原生 permissions 配置的预授权白名单(项目目录、`/tmp/opencode/` 等),作为后续增强,不进 v1。
+- **预信任路径**:已解决(2026-09-30):`octl create --trust` 经 POST /api/session 的 `permissions: Permission.Ruleset` 实现——caller 声明、会话作用域、随会话消亡,比 always 沉淀的持久项目规则更窄且在 transcript 可审计。
 
 ### 路由缓存
 

@@ -637,6 +637,22 @@ def cmd_agents(args, config):
     return EXIT_OK
 
 
+# Each --trust PATTERN pre-authorizes the path/resource for the session by adding
+# one allow rule per action. external_directory gates paths outside the session's
+# location; read/edit cover file reads and writes (the triple mirrors the static
+# opencode permission surface).
+TRUST_ACTIONS = ("external_directory", "read", "edit")
+
+
+def expand_trust(patterns):
+    """Expand --trust PATTERNs into Permission.Ruleset rules (allow each action)."""
+    rules = []
+    for pattern in patterns or []:
+        for action in TRUST_ACTIONS:
+            rules.append({"action": action, "resource": pattern, "effect": "allow"})
+    return rules
+
+
 def cmd_create(args, config):
     endpoint = resolve_endpoint(args, config)
     conn = endpoint.connection()
@@ -646,6 +662,19 @@ def cmd_create(args, config):
         body["title"] = args.title
     if args.agent:
         body["agent"] = args.agent
+    # Advanced stdin passthrough: {"permissions": [full rules]}. Stdin rules come
+    # first, --trust expansions are appended after, so under last-match-wins the
+    # caller-declared --trust rules override conflicting stdin rules.
+    stdin_obj = read_stdin_json()
+    permissions = []
+    if isinstance(stdin_obj, dict) and "permissions" in stdin_obj:
+        provided = stdin_obj["permissions"]
+        if not isinstance(provided, list):
+            raise UsageError('stdin "permissions" must be a JSON array of rules')
+        permissions.extend(provided)
+    permissions.extend(expand_trust(getattr(args, "trust", None)))
+    if permissions:
+        body["permissions"] = permissions
     data = unwrap(http_request(conn, "POST", "/api/session", body=body))
     if not isinstance(data, dict):
         data = {}
@@ -984,6 +1013,17 @@ COMMANDS = {
 # Argument parser
 # ---------------------------------------------------------------------------
 
+CREATE_EPILOG = """\
+`--trust PATTERN` (repeatable) pre-authorizes PATTERN for this session only: the
+rules are caller-declared, session-scoped and die with the session. Each PATTERN
+adds allow rules for external_directory, read and edit. Use it for scratch dirs
+like /tmp/opencode/* to avoid permission rounds.
+
+Advanced: pass {"permissions": [full rules]} as JSON on stdin for deny/ask/shell
+rules. Stdin rules come first; --trust rules are appended after, so under
+last-match-wins --trust overrides a conflicting stdin rule.
+"""
+
 WAIT_EPILOG = """\
 exit codes for `wait`:
   0  succeeded (or --once while the session is still running: status=running)
@@ -1025,10 +1065,19 @@ def build_parser():
 
     sub.add_parser("agents", parents=[common], help="list agents and their configured models")
 
-    p_create = sub.add_parser("create", parents=[common], help="create a session")
+    p_create = sub.add_parser(
+        "create", parents=[common], help="create a session",
+        epilog=CREATE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_create.add_argument("--directory", help="absolute (or cwd-relative) working directory")
     p_create.add_argument("--title", help="session title")
     p_create.add_argument("--agent", help="agent name")
+    p_create.add_argument(
+        "--trust", action="append", metavar="PATTERN",
+        help="pre-authorize a resource pattern for this session only (repeatable; "
+             "caller-declared, session-scoped, dies with the session)",
+    )
 
     p_chat = sub.add_parser("chat", parents=[common],
                             help="submit a prompt (async; returns immediately)")

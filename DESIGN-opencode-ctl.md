@@ -118,7 +118,7 @@ Retained mapping: `doctor` `endpoints` `agents` `create` `chat` `wait` `messages
 - **`wait`**: `--timeout` default **300s** (blocking long-poll, loops within a single process); `--once` = single snapshot + cursor (the agent manages its own loop); **manual permission mode only, no automatic answering of any kind** — permissions must be approved by the agent. The skill explicitly instructs: answer `always` to safe requests to reduce turns;
 - **`pending` / pending-type queries**: subtree-scoped (precise idset membership filtering over the `parentID` tree; a subagent request is reported to the parent-session controller, with the payload carrying the real owner `sessionID`); fall back to the per-session endpoint when the global endpoint is unavailable; failing that, `verified=false` empty set, fail closed;
 - **`permission-reply` / `form-reply`**: addressed within the session (the `/api/session/{sid}/permission/{rid}/reply` path itself is bound to the session);
-- **pre-trust path** (the proper way to reduce permission turns): after implementation is complete, explore opencode's native permissions config for a pre-authorization allowlist (project directories, `/tmp/opencode/`, etc.), as a follow-up enhancement, not part of v1.
+- **pre-trust path**: Resolved (2026-09-30): `octl create --trust` via the session-create `permissions` ruleset — caller-declared, session-lifetime scope, narrower and more auditable than persistent always-saves.
 
 ### Route cache
 

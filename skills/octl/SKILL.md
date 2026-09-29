@@ -18,6 +18,7 @@ version baseline. It does not discover endpoints.
 **b. Start a round.**
 ```
 octl create                      # runs from the project dir; or: octl create --directory /abs/path
+octl create --trust "/tmp/opencode/*"   # pre-trust scratch paths for this session only
 # -> JSON containing a ses_... id
 octl chat -s ses_... --text "your instruction"   # async: enqueues and returns immediately
 octl wait -s ses_...                        # blocks up to --timeout (default 300s)
@@ -69,7 +70,7 @@ The `status` field is also always present in the JSON.
 | `doctor` | Session-first hard gate: reachability, `/api/info` v2 shape, auth, version baseline. |
 | `endpoints` | List endpoint aliases + URL + version baseline status (no liveness probe); `--check` adds per-endpoint liveness, auth check, and baseline. |
 | `agents` | List agents and their resolved default models (read-only). |
-| `create` | Create a session; sends the cwd as location, `--directory` overrides. Returns a `ses_` id. |
+| `create` | Create a session; sends the cwd as location, `--directory` overrides. `--trust PATTERN` (repeatable) pre-authorizes paths for this session. Returns a `ses_` id. |
 | `chat` | Enqueue a prompt asynchronously and return (does not block). |
 | `wait` | Wait for a terminal or needs-interaction state; `--timeout` default 300s; `--once` = single snapshot + cursor. |
 | `messages` | Fetch messages; `--after <id>` returns only new output and the next cursor. |
@@ -90,6 +91,9 @@ The `status` field is also always present in the JSON.
 - **Pending is subtree-scoped:** a subagent's permission/form is reported to the parent
   controller, and its payload carries the request's real owner `sessionID`. Reply using that
   sessionID, not necessarily the parent's.
+- **Pre-trust a scratch dir:** `create --trust PATTERN` (repeatable) pre-authorizes resources for this
+  session only — caller-declared, session-scoped, dies with the session — e.g. `/tmp/opencode/*` to
+  avoid permission rounds.
 - **Endpoints are operator-configured:** use aliases only — never URLs or passwords.
 - **interrupt** cancels a running task (e.g. after a timeout); **compact** trims context when it
   nears its limit; **context** shows tokens/cost before compacting; **delete** removes a session

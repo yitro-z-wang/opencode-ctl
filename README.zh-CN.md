@@ -85,6 +85,8 @@ octl messages -s ses_... --after <游标>         # 从 last_message_id 游标�
 - **agent 面没有 URL** —— 只有别名;别名 → 端点的映射只存在于操作者配置里。
 - **不允许枚举会话** —— 没有 `list` 动词。pending 类查询按会话子树作用域过滤,无法验证时空集
   失败关闭。
+- **操作者预信任:** 操作者还可通过 opencode 自身的权限配置(`opencode.json` 中的 `permissions`
+  规则)全局预信任路径/命令——见 <https://opencode.ai/v2/docs/permissions>。
 - **范围外:** 同用户的恶意 agent 可以直接读取配置文件与 opencode 状态目录。这是宿主权限门控的
   职责,CLI 层无法兜底。
 
