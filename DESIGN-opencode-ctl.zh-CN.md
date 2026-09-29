@@ -100,6 +100,17 @@ CLI 面仅有:`endpoints`(枚举别名+URL+版本基准状态,不探活)、`endp
 
 保留映射:`doctor` `endpoints` `agents` `create` `chat` `wait` `messages` `permission-reply` `form-reply` `pending` `interrupt` `compact` `context` `delete`。
 
+### 参数命名约定(阶段 3 实施中固化的契约细化)
+
+- 会话寻址旗标:`-s SES` / `--session SES`;
+- `permission-reply -s SES --request-id RID --decision once|always|reject [--message M]`;
+- `form-reply -s SES --form-id FID`,字段答案以 JSON 对象从 stdin 传入(`{"fieldKey": value}`);
+- 游标字段名:`last_message_id`(与现有 MCP `get_messages`/`wait` 输出一致);
+- 等待旗标:`--timeout`(秒,缺省 300),不用 `timeout_secs`;
+- `create` 返回 JSON 顶层键含 `session_id`;
+- `chat` v1 参数面:`--text`(或 stdin JSON 传 `{"text": ...}`);v2 的 `files`/`delivery` 不进 v1;
+- 未列出旗标的动词(`pending`/`interrupt`/`compact`/`context`/`delete`)只用 `-s SES`(+全局 `--endpoint`)。
+
 ### 关键语义
 
 - **输出**:JSON→stdout,人读日志→stderr;退出码:0 成功 / 2 用法 / 3 `[availability]` / 4 `[compatibility]` / 5 `[other]` / 6 超时 / 7 needs_permission / 8 needs_form。`status` 字段始终同时在 JSON 里;
