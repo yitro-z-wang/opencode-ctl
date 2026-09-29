@@ -70,7 +70,7 @@ The `status` field is also always present in the JSON.
 | `doctor` | Session-first hard gate: reachability, `/api/info` v2 shape, auth, version baseline. |
 | `endpoints` | List endpoint aliases + URL + version baseline status (no liveness probe); `--check` adds per-endpoint liveness, auth check, and baseline. |
 | `agents` | List agents and their resolved default models (read-only). |
-| `create` | Create a session; sends the cwd as location, `--directory` overrides. `--trust PATTERN` (repeatable) pre-authorizes paths for this session. Returns a `ses_` id. |
+| `create` | Create a session; sends the cwd as location, `--directory` overrides. `--trust PATTERN` (repeatable) pre-authorizes paths for this session. `--model PROVIDER/ID[#variant]` pins this session's model. Returns a `ses_` id. |
 | `chat` | Enqueue a prompt asynchronously and return (does not block). |
 | `wait` | Wait for a terminal or needs-interaction state; `--timeout` default 300s; `--once` = single snapshot + cursor. |
 | `messages` | Fetch messages; `--after <id>` returns only new output and the next cursor. |
@@ -94,6 +94,8 @@ The `status` field is also always present in the JSON.
 - **Pre-trust a scratch dir:** `create --trust PATTERN` (repeatable) pre-authorizes resources for this
   session only — caller-declared, session-scoped, dies with the session — e.g. `/tmp/opencode/*` to
   avoid permission rounds.
+- **Pin a model per session:** `create --model PROVIDER/ID[#variant]` overrides the server's default
+  model for this session only — e.g. a cheap flash model for simple tasks.
 - **Endpoints are operator-configured:** use aliases only — never URLs or passwords.
 - **interrupt** cancels a running task (e.g. after a timeout); **compact** trims context when it
   nears its limit; **context** shows tokens/cost before compacting; **delete** removes a session

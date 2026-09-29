@@ -66,7 +66,7 @@ octl messages -s ses_... --after <last_message_id>
 | `doctor` | 会话首步硬门禁：可达性、`/api/info` v2 形状、认证、版本基准。 |
 | `endpoints` | 枚举端点别名＋URL＋版本基准状态（不探活）；`--check` 追加逐端点探活、认证校验与基准。 |
 | `agents` | 列出 agent 及其解析后的默认模型（只读）。 |
-| `create` | 创建会话；以 cwd 作为 location，`--directory` 可覆盖。`--trust PATTERN`（可重复）为本会话预授权路径。返回 `ses_` id。 |
+| `create` | 创建会话；以 cwd 作为 location，`--directory` 可覆盖。`--trust PATTERN`（可重复）为本会话预授权路径。`--model PROVIDER/ID[#variant]` 为本会话固定模型。返回 `ses_` id。 |
 | `chat` | 异步入队一条提示并返回（不阻塞）。 |
 | `wait` | 等待终态或需交互状态；`--timeout` 缺省 300s；`--once` = 单次快照＋游标。 |
 | `messages` | 拉取消息；`--after <id>` 只返回新输出及下一个游标。 |
@@ -87,6 +87,8 @@ octl messages -s ses_... --after <last_message_id>
   属主 `sessionID`。回应时用该 sessionID，而不一定是父会话的。
 - **预信任 scratch 目录：** `create --trust PATTERN`（可重复）仅为本会话预授权资源——caller 声明、
   会话作用域、随会话消亡——例如 `/tmp/opencode/*`，以避免权限轮次。
+- **为会话固定模型：** `create --model PROVIDER/ID[#variant]` 仅为本会话覆盖服务器默认模型——
+  例如对简单任务使用便宜的 flash 模型。
 - **端点为操作者配置：** 只用别名——绝不用 URL 或密码。
 - **interrupt** 取消运行中的任务（例如超时后）；**compact** 在上下文接近上限时裁剪；
   **context** 在压缩前查看 tokens/cost；**delete** 删除会话及其全部子会话。

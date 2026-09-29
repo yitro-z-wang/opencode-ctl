@@ -653,6 +653,29 @@ def expand_trust(patterns):
     return rules
 
 
+def parse_model_ref(value):
+    """Parse ``PROVIDER/ID[#variant]`` into the Model.Ref body shape.
+
+    Splits on the FIRST "/", so a model id may itself contain slashes; an
+    optional ``#variant`` suffix (e.g. ``yitro/glm-5.3#default``) adds the
+    ``variant`` field. A missing "/" is a usage error (exit 2).
+    """
+    if "/" not in value:
+        raise UsageError(
+            "--model expects PROVIDER/ID (optionally PROVIDER/ID#variant), "
+            "e.g. yitro/glm-5.3; got %r" % value
+        )
+    provider, rest = value.split("/", 1)
+    model_id = rest
+    variant = None
+    if "#" in rest:
+        model_id, variant = rest.split("#", 1)
+    ref = {"providerID": provider, "id": model_id}
+    if variant:
+        ref["variant"] = variant
+    return ref
+
+
 def cmd_create(args, config):
     endpoint = resolve_endpoint(args, config)
     conn = endpoint.connection()
@@ -662,6 +685,8 @@ def cmd_create(args, config):
         body["title"] = args.title
     if args.agent:
         body["agent"] = args.agent
+    if args.model:
+        body["model"] = parse_model_ref(args.model)
     # Advanced stdin passthrough: {"permissions": [full rules]}. Stdin rules come
     # first, --trust expansions are appended after, so under last-match-wins the
     # caller-declared --trust rules override conflicting stdin rules.
@@ -1073,6 +1098,11 @@ def build_parser():
     p_create.add_argument("--directory", help="absolute (or cwd-relative) working directory")
     p_create.add_argument("--title", help="session title")
     p_create.add_argument("--agent", help="agent name")
+    p_create.add_argument(
+        "--model", metavar="PROVIDER/ID",
+        help="pin this session's model, overriding the server default "
+             "(form PROVIDER/ID[#variant], e.g. yitro/glm-5.3)",
+    )
     p_create.add_argument(
         "--trust", action="append", metavar="PATTERN",
         help="pre-authorize a resource pattern for this session only (repeatable; "

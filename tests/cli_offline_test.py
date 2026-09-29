@@ -13,7 +13,7 @@ parsing (TOML, ``password_command``, loose-permission warning), the routes
 database (write / lookup / miss), URL-as-alias rejection, the ``OpenCodeError``
 kind -> exit-code mapping (monkeypatched), stdin JSON argument handling, the
 create permission pre-trust surface (``--trust`` expansion, stdin merge order,
-omission when unused) and the credential non-leak invariant in a wrong-password
+omission when unused, and the ``--model`` per-session pin) and the credential non-leak invariant in a wrong-password
 run.
 
 Each scenario prints PASS/FAIL; the process exits 1 when any scenario fails.
@@ -525,6 +525,44 @@ def scenario_create_permissions(reporter):
             "create omits the permissions key when neither is given",
             plain.returncode == 0 and "permissions" not in create_body(),
             "rc=%s body=%s" % (plain.returncode, json.dumps(create_body())),
+        )
+
+        # (d) --model PROVIDER/ID is sent as the Model.Ref body shape.
+        pinned = box.run(["create", "--title", "mp", "--model", "yitro/glm-5.3"])
+        reporter.check(
+            "create --model sends providerID + id",
+            pinned.returncode == 0
+            and create_body().get("model") == {"providerID": "yitro", "id": "glm-5.3"},
+            "rc=%s body=%s" % (pinned.returncode, json.dumps(create_body())),
+        )
+
+        # (e) an optional #variant suffix adds the variant field.
+        varied = box.run(
+            ["create", "--title", "mv", "--model", "yitro/glm-5.3#default"]
+        )
+        reporter.check(
+            "create --model #variant suffix adds variant",
+            varied.returncode == 0
+            and create_body().get("model") == {
+                "providerID": "yitro", "id": "glm-5.3", "variant": "default",
+            },
+            "rc=%s body=%s" % (varied.returncode, json.dumps(create_body())),
+        )
+
+        # (f) a --model value without "/" is a usage error (exit 2).
+        bad = box.run(["create", "--title", "mb", "--model", "glm-5.3"])
+        reporter.check(
+            "create --model without PROVIDER/ID exits 2",
+            bad.returncode == 2 and "--model" in bad.stderr and "PROVIDER/ID" in bad.stderr,
+            "rc=%s stderr=%r" % (bad.returncode, bad.stderr[:120]),
+        )
+
+        # (g) no --model -> the model key is absent (server default applies).
+        bare = box.run(["create", "--title", "mn"])
+        reporter.check(
+            "create omits the model key when --model is absent",
+            bare.returncode == 0 and "model" not in create_body(),
+            "rc=%s body=%s" % (bare.returncode, json.dumps(create_body())),
         )
     finally:
         server.close()
