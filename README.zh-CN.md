@@ -1,88 +1,96 @@
-# opencode-mcp
+# opencode-ctl (`octl`)
 
 [English](README.md) | **中文**
 
-让任意 MCP 客户端驱动一个 **opencode** 会话:创建会话、发送 prompt、收集结果、答复权限请求与表单,并在本地/远端多个 opencode 服务端之间路由。零依赖 —— 单文件纯 Python 标准库。
+`octl` 是一个面向 agent 的命令行客户端与配套 skill,通过 v2 HTTP API 驱动**由操作者部署**的
+`opencode serve`。每次调用即一个进程:JSON 走 **stdout**,人读日志走 **stderr**,**退出码**即
+结果类别。
 
-**为什么需要它**:在 agent 普遍以 ACP(Agent Client Protocol)客户端身份直连 opencode 之前,通过 **HTTP API** 以 MCP 驱动 opencode 是 agent 操作它的最佳方案 —— 本 server 就是为此而建:每个工具对应一套干净、机器可消费的状态机(权威终态、阻塞交互态、增量游标),而不是界面的复刻,天然适合 agent 编排。
+本仓库由 `opencode-mcp` 改名而来。CLI 达到功能对等后,原 MCP server 已整块退役 —— 决策依据见
+[DESIGN-remote-connections.md](DESIGN-remote-connections.zh-CN.md)。
 
-实测环境:
+## 要求
 
-- **opencode v2.0.12** —— 开发基准,全部能力均对其 live 验证
-- **真实远端实例** —— 完整网络端到端(连接 → 建会话 → 对话 → manual 权限 → 答复 → 等待 → 增量拉取 → 断连)
-- **Hermes agent gateway** —— 作为工具提供方挂载并在生产使用
-- **oh-my-opencode-slim 编排框架** —— 托管本 MCP 并借此驱动嵌套 opencode 会话
+- **Python ≥ 3.11**(纯标准库,无任何第三方包)。
+- 一个**由操作者运行的 `opencode serve`**。`octl` 绝不自行拉起服务,只连接一个已就绪的实例。
+- 可选:若通过 `password_command` 配置凭据,需要 PATH 上有 `pass` 一类的辅助工具。
 
-## 范围
+## 安装
 
-这**不是**面面俱到的 opencode 控制面,也不打算是。范围刻意收敛到 agent 日常操作 opencode 真正需要的能力:
-
-- 创建/恢复会话、发送 prompt、收集结果
-- 处理两种阻塞交互 —— 权限请求与表单
-- 上下文管理(用量查看、压缩)与会话生命周期
-- 多 opencode 服务端(本地与远端)的路由
-
-文件系统、凭据、provider、插件、终端、配置等管理面**刻意不做**。工具更少、语义更锋利、出错面更小。
-
-## 用 LLM 安装
-
-把下面这段交给你的编码 agent:
-
-```text
-帮我安装并注册 opencode-mcp:
-
-1. 克隆: git clone https://github.com/yitro-z-wang/opencode-mcp ~/opencode-mcp
-2. 验证: 运行 `python3 ~/opencode-mcp/test_client.py` —— 必须报告 16 个工具且通过。
-3. 注册到 opencode: `opencode mcp add opencode-local -- python3 ~/opencode-mcp/server.py`
-4. 重载 opencode 配置,然后新开一个会话确认 16 个 opencode-local 工具可用。
-
-要求: Python 3.10+ 且 opencode CLI 在 PATH 上(v2.0.12 为开发基准)。
-出错请原样回报,不要盲目重试。
+```sh
+git clone https://github.com/yitro-z-wang/opencode-ctl ~/opencode-ctl
+ln -s ~/opencode-ctl/octl ~/.local/bin/octl     # 确认 ~/.local/bin 在 PATH 上
 ```
 
-也可以自己注册:`opencode mcp add opencode-local -- python3 /path/to/server.py`(任何 MCP 客户端均可,本 server 走 stdio)。
+把 `skills/octl/` 复制(或符号链接)到宿主 agent 的 skill 目录即可安装 skill,例如:
 
-## 特性
+- `~/.opencode/skills/octl/`(项目本地为 `.opencode/skills/`)
+- `~/.claude/skills/octl/`
+- 其他任何兼容 SKILL.md 的宿主的等价 skill 目录
 
-- **零依赖** —— 纯 Python 3 标准库,单文件,无构建步骤
-- **多服务器** —— MCP 专属拉起本地 `opencode serve`(随机端口+随机密码,随 MCP 退出)或 `OPENCODE_URL` 显式直连;远端运行时注册;会话自动路由到归属服务端
-- **权威状态,不做猜测** —— 终态取自 opencode 的会话 outcome,而非消息形状推断
-- **多 agent 感知** —— 被委派的子 agent 不会被误判为“已完成”,其权限请求会被上报(见文档)
-- **失败分类** —— 每次失败归类为 `[availability] / `[compatibility]` / `[other]`,并保留原始报错便于回报
-- **安全默认** —— 远端 `chat` 默认手动审批;凭据 `文件 > env > 明文`
-- **可组合原语** —— `wait_session`(纯状态)与 `get_messages`(增量游标)把“等待”和“读取”分离
-- **生产级运行时** —— 并发请求处理、MCP 标准取消、有界等待
+## 配置
 
-## 工具
+`octl` 只读取一个操作者私有的文件 `~/.config/octl/endpoints.toml`(权限 **0600**)。没有任何
+CLI 动词会写它 —— 手动编辑。
 
-| 工具 | 作用 |
-| --- | --- |
-| `create_session` | 创建会话(可选 title / agent / model / location) |
-| `chat` | 发送 prompt 并等待结果;支持附件与 `steer` / `queue` 投递;可自动答复权限 |
-| `wait_session` | 纯状态等待:`succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout` |
-| `get_messages` | 读取消息记录;经 `after_message_id` 增量拉取 |
-| `permission_reply` | 答复权限请求:`once` / `always` / `reject` |
-| `form_reply` | 按字段提交表单答案 |
-| `list_agents` | 列出 agent 及其解析后的默认模型(只读) |
-| `interrupt` | 中断当前生成 |
-| `pending_interactions` | 非阻塞查询待处理权限/表单 |
-| `list_sessions` | 枚举/搜索会话 —— 恢复历史话题的句柄 |
-| `compact` | 压缩上下文并等待完成 |
-| `get_context` | token/成本用量与会话元信息 |
-| `delete_session` | 删除会话(不可逆,级联删除子会话) |
-| `connect_server` | 注册并验证远端 opencode 连接 |
-| `list_servers` | 列出全部连接及版本/基准状态 |
-| `disconnect_server` | 移除动态注册的远端连接 |
+```toml
+default = "main"
 
-全部工具支持可选 `server` 参数;带 `session_id` 的调用自动路由到该会话所属连接。`chat` 与 `wait_session` 都接受 `wait_for_subagents`,但两者默认值不同 —— 详见文档。
+[endpoints.main]
+url = "http://127.0.0.1:4096"
+username = "opencode"                      # 可省,v2 basic auth 缺省用户
+password = "..."                           # 二选一
+
+[endpoints.lab]
+url = "https://build-box.example.com:4096"
+password_command = ["pass", "show", "opencode/lab"]   # 秘密不落盘的替代通道
+```
+
+解析顺序:显式 `--endpoint <别名>` → 配置中的 `default` → `OPENCODE_URL` / `OPENCODE_PASSWORD`
+环境变量。端点只以**别名**寻址;没有服务发现。
+
+## 快速开始
+
+```sh
+octl doctor                                    # 硬门禁:可达性、v2 形状、认证、基准
+octl create                                    # -> JSON,包含 ses_... 会话 id
+octl chat -s ses_... --text "你的指令"           # 异步:入队即返回,不阻塞
+octl wait -s ses_...                           # 阻塞,最长到 --timeout(缺省 300s)
+octl messages -s ses_... --after <游标>         # 从 last_message_id 游标增量读取
+```
+
+`create` 总是显式发送 location(缺省为当前目录,可用 `--directory` 覆盖);此后所有命令只按
+`ses_` id 寻址会话。提示很长或较复杂时,把正文以 stdin 上的 JSON(`{"text": ...}`)传入,而非
+放进 argv(防引号注入)。
+
+**退出码**
+
+| 码 | status | 含义 |
+| --- | --- | --- |
+| 0 | success | 命令完成;对 `wait`/`chat` 表示到达终态 |
+| 2 | usage | 调用方式或参数错误 |
+| 3 | `[availability]` | 端点不可达 / 不可用 |
+| 4 | `[compatibility]` | API 或版本不兼容(需要 v2 API) |
+| 5 | `[other]` | 未分类错误 |
+| 6 | timeout | `wait`/`chat` 超时;会话可能仍在生成 |
+| 7 | needs_permission | 阻塞,等待权限审批 |
+| 8 | needs_form | 阻塞,等待表单输入 |
+
+`status` 字段也始终同时出现在 JSON 里。
+
+## 安全模型
+
+- **凭据只从操作者通道进入**(配置文件 / env / `password_command`)。agent 面没有任何凭据参数,
+  也没有写端点的动词。
+- **agent 面没有 URL** —— 只有别名;别名 → 端点的映射只存在于操作者配置里。
+- **不允许枚举会话** —— 没有 `list` 动词。pending 类查询按会话子树作用域过滤,无法验证时空集
+  失败关闭。
+- **范围外:** 同用户的恶意 agent 可以直接读取配置文件与 opencode 状态目录。这是宿主权限门控的
+  职责,CLI 层无法兜底。
 
 ## 文档
 
-- [连接模型、环境变量、取消](docs/connection-model.zh-CN.md) · [English](docs/connection-model.md)
-- [会话、agent 与模型选择](docs/sessions.zh-CN.md) · [English](docs/sessions.md)
-- [权限与表单流程、权限规则](docs/interactions.zh-CN.md) · [English](docs/interactions.md)
-- [多 agent 会话中的子会话感知等待](docs/subagent-waiting.zh-CN.md) · [English](docs/subagent-waiting.md)
-- [工具参数参考](docs/tools.zh-CN.md) · [English](docs/tools.md)
-- [已验证流程与测试](docs/verification.zh-CN.md) · [English](docs/verification.md)
-- [场景测试套件](tests/README.zh-CN.md) · [English](tests/README.md)
-- [设计记录:远端连接](DESIGN-remote-connections.zh-CN.md) · [English](DESIGN-remote-connections.md)
+- [设计:opencode-ctl(`octl`)](DESIGN-opencode-ctl.zh-CN.md) · [English](DESIGN-opencode-ctl.md)
+- [Agent skill](skills/octl/SKILL.zh-CN.md) · [English](skills/octl/SKILL.md)
+- [测试](tests/README.zh-CN.md) · [English](tests/README.md)
+- [历史:远端连接设计记录(已退役的 MCP)](DESIGN-remote-connections.zh-CN.md) · [English](DESIGN-remote-connections.md)

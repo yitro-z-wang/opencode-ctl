@@ -1,3 +1,5 @@
+> Written for the retired MCP surface (superseded by DESIGN-opencode-ctl.md); the interaction/session/subtree semantics carry over to the octl CLI.
+
 # Subagent-aware waiting (multi-agent sessions)
 
 **English** | [中文](subagent-waiting.zh-CN.md)

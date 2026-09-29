@@ -1,3 +1,5 @@
+> 历史文档(2026-09-30 被 DESIGN-opencode-ctl.md 取代)——描述已退役的 MCP server;保留作为决策记录。
+
 # 设计定稿:多 opencode 连接(已实施)
 
 [English](DESIGN-remote-connections.md) | **中文**

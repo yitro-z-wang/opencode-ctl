@@ -1,3 +1,5 @@
+> Historical (superseded 2026-09-30 by DESIGN-opencode-ctl.md) — describes the retired MCP server; kept for the decision record.
+
 # Design: multiple opencode connections (implemented)
 
 **English** | [中文](DESIGN-remote-connections.zh-CN.md)

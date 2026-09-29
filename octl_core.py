@@ -163,7 +163,7 @@ class VersionWarnings:
             "baseline": DEVELOPMENT_BASELINE_VERSION,
             "current": conn.server_version,
             "severity": "high" if major else "low",
-            "message": "opencode server (%s) version %s does not match the MCP development baseline %s; %s, behavior may differ."
+            "message": "opencode server (%s) version %s does not match the development baseline %s; %s, behavior may differ."
             % (
                 conn.name,
                 conn.server_version,
@@ -654,7 +654,7 @@ def _mark_capability_unsupported(conn, cap, exc):
             return False
         conn.subtree_unsupported.add(cap)
     log(
-        "[opencode-mcp] subtree capability %s unsupported on %s, falling back to legacy: %s"
+        "[octl] subtree capability %s unsupported on %s, falling back to legacy: %s"
         % (cap, conn.name, exc)
     )
     return True
@@ -813,7 +813,7 @@ def _session_pending(conn, sid, kind):
             "/api/session/%s/%s" % (urllib.parse.quote(sid, safe=""), kind),
         )
     except OpenCodeError as exc:
-        log("[opencode-mcp] per-session %s lookup failed" % kind, sid, exc)
+        log("[octl] per-session %s lookup failed" % kind, sid, exc)
         return None, False
     data = unwrap(payload)
     if not isinstance(data, list):
@@ -974,7 +974,7 @@ def _autoreply_subtree_permissions(conn, snap, decision, replied):
                 body={"decision": decision},
             )
         except OpenCodeError as exc:
-            log("[opencode-mcp] subtree permission auto-reply failed", owner, rid, exc)
+            log("[octl] subtree permission auto-reply failed", owner, rid, exc)
 
 
 def _enrich_forms(conn, forms):
@@ -1182,7 +1182,7 @@ def poll_once(
                         body={"decision": auto_permission},
                     )
                 except OpenCodeError as exc:
-                    log("[opencode-mcp] permission auto-reply failed", rid, exc)
+                    log("[octl] permission auto-reply failed", rid, exc)
         else:
             snapshot["status"] = "needs_permission"
             snapshot["payload"] = {

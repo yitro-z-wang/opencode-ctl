@@ -1,3 +1,5 @@
+> 为已退役的 MCP 面而写(已被 DESIGN-opencode-ctl.md 取代);交互/会话/子树语义沿用至 octl CLI。
+
 # 模型选择说明
 
 [English](sessions.md) | **中文**

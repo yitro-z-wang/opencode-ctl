@@ -1,3 +1,5 @@
+> 历史文档(2026-09-30 被 DESIGN-opencode-ctl.md 取代)——描述已移除的 MCP 工具面;保留作为决策记录。
+
 # Tools
 
 [English](tools.md) | **中文**

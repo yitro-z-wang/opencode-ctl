@@ -1,3 +1,5 @@
+> 为已退役的 MCP 面而写(已被 DESIGN-opencode-ctl.md 取代);交互/会话/子树语义沿用至 octl CLI。
+
 # 子会话感知等待(多 agent 会话)
 
 [English](subagent-waiting.md) | **中文**

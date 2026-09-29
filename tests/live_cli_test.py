@@ -33,7 +33,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mcp_client import Reporter, opencode_on_path  # noqa: E402
+from cli_common import Reporter, opencode_on_path  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)

@@ -1,90 +1,102 @@
-# opencode-mcp
+# opencode-ctl (`octl`)
 
 **English** | [中文](README.zh-CN.md)
 
-Drive an **opencode** session from any MCP client: create sessions, send prompts, collect results, answer permission requests and forms, and route across local and remote opencode servers. Zero dependencies — one Python file, standard library only.
+`octl` is an agent-facing command-line client plus a skill for driving an **operator-deployed**
+`opencode serve` over its v2 HTTP API. Each call is a one-shot process: JSON goes to **stdout**,
+human logs go to **stderr**, and the **exit code** is the result class.
 
-## Why this exists
+This repo was renamed from `opencode-mcp`. The original MCP server has been retired now that the
+CLI reaches feature parity — see [DESIGN-remote-connections.md](DESIGN-remote-connections.md) for
+the decision record behind it.
 
-Until agents commonly speak ACP (Agent Client Protocol) directly to opencode, driving opencode over its **HTTP API** through MCP is the best available route for an agent to operate opencode — and this server is built for exactly that: every tool maps to a clean, machine-consumable state machine (authoritative terminal states, blocking interaction states, incremental cursors) rather than a UI replica, which makes it a native fit for agent orchestration.
+## Requirements
 
-Tested in real use with:
+- **Python ≥ 3.11** (standard library only; no third-party packages).
+- An **`opencode serve` that the operator runs**. `octl` never spawns a server — it only talks to
+  one that is already up.
+- Optional: a `pass`-style helper on `PATH` if you configure credentials via `password_command`.
 
-- **opencode v2.0.12** — the development baseline; every capability is live-verified against it
-- **a real remote instance** — full end-to-end over the network (connect → create → chat → manual permission → reply → wait → incremental fetch → disconnect)
-- **the Hermes agent gateway** — mounted as a tool provider and used in production
-- **the oh-my-opencode-slim agent orchestration framework** — hosts the MCP and drives nested opencode sessions through it
+## Install
 
-## Scope
-
-This is **not** a complete control surface for every aspect of opencode, and it does not try to be. It is deliberately scoped to what an agent actually needs for day-to-day opencode interaction:
-
-- create and resume sessions, send prompts, collect results
-- handle the two blocking interactions — permission requests and forms
-- manage context (usage inspection, compaction) and session lifecycle
-- route across multiple opencode servers (local and remote)
-
-Management-plane surfaces — filesystem, credentials, providers, plugins, terminals, config — are intentionally out of scope. Fewer tools, sharper semantics, less to get wrong.
-
-## Install with your LLM
-
-Paste this into your coding agent:
-
-```text
-Install and register opencode-mcp for me:
-
-1. Clone: git clone https://github.com/yitro-z-wang/opencode-mcp ~/opencode-mcp
-2. Verify: run `python3 ~/opencode-mcp/test_client.py` — it must report 16 tools and pass.
-3. Register with opencode: `opencode mcp add opencode-local -- python3 ~/opencode-mcp/server.py`
-4. Reload opencode config, then start a new session and confirm the 16 opencode-local tools are available.
-
-Requirements: Python 3.10+ and the opencode CLI on PATH (v2.0.12 is the development baseline).
-Report any errors verbatim; do not retry blindly.
+```sh
+git clone https://github.com/yitro-z-wang/opencode-ctl ~/opencode-ctl
+ln -s ~/opencode-ctl/octl ~/.local/bin/octl     # ensure ~/.local/bin is on PATH
 ```
 
-Or register it yourself: `opencode mcp add opencode-local -- python3 /path/to/server.py` (any MCP client works; the server speaks stdio).
+Install the skill by copying (or symlinking) `skills/octl/` into your agent host's skill directory,
+for example:
 
-## Features
+- `~/.opencode/skills/octl/` (project-local: `.opencode/skills/`)
+- `~/.claude/skills/octl/`
+- the equivalent skill directory for any other SKILL.md-compatible host
 
-- **Zero dependencies** — pure Python 3 standard library, one file, no build step.
-- **Multi-server** — an MCP-spawned local `opencode serve` (random port + password, dies with the MCP) or an explicit `OPENCODE_URL`; remotes registered at runtime; sessions route to their own server automatically.
-- **Authoritative state, no guessing** — terminal states come from opencode's session outcome, not message-shape heuristics.
-- **Multi-agent aware** — delegated subagents cannot be mistaken for "done", and their permission requests are surfaced (see the docs).
-- **Failure classification** — every failure is classified `[availability] / [compatibility] / [other]`, with the raw error preserved for reporting.
-- **Safe defaults** — remote `chat` defaults to manual permission approval; credentials use `file > env > plaintext` priority.
-- **Composable primitives** — `wait_session` (pure state) and `get_messages` (incremental cursor) separate waiting from reading.
-- **Production-grade runtime** — concurrent request handling, MCP-standard cancellation, bounded waits.
+## Configuration
 
-## Tools
+`octl` reads a single operator-owned file at `~/.config/octl/endpoints.toml` (mode **0600**). There
+are no CLI verbs that write it — edit it by hand.
 
-| Tool | What it does |
-| --- | --- |
-| `create_session` | Create a session (optional title / agent / model / location) |
-| `chat` | Send a prompt and wait for the result; attachments; `steer` / `queue` delivery; can auto-answer permissions |
-| `wait_session` | Pure state wait: `succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout` |
-| `get_messages` | Read the transcript; incremental pulls via `after_message_id` |
-| `permission_reply` | Answer a permission request: `once` / `always` / `reject` |
-| `form_reply` | Submit a form answer keyed by field |
-| `list_agents` | List agents and their resolved default models (read-only) |
-| `interrupt` | Stop the current generation |
-| `pending_interactions` | Non-blocking check for pending permissions / forms |
-| `list_sessions` | Enumerate / search sessions — the resume handle for earlier conversations |
-| `compact` | Compact context and wait for completion |
-| `get_context` | Token / cost usage and session metadata |
-| `delete_session` | Delete a session (irreversible; cascades to child sessions) |
-| `connect_server` | Register and validate a remote opencode connection |
-| `list_servers` | List connections with version and baseline status |
-| `disconnect_server` | Remove a dynamically registered remote connection |
+```toml
+default = "main"
 
-All tools accept an optional `server` parameter; calls carrying a `session_id` are routed automatically to the connection that owns that session. Both `chat` and `wait_session` take `wait_for_subagents` — the default differs between them, see the docs.
+[endpoints.main]
+url = "http://127.0.0.1:4096"
+username = "opencode"                      # optional; v2 basic-auth default user
+password = "..."                           # either password ...
+
+[endpoints.lab]
+url = "https://build-box.example.com:4096"
+password_command = ["pass", "show", "opencode/lab"]   # ... or a secret that never hits disk
+```
+
+Resolution order: explicit `--endpoint <alias>` → the configured `default` →
+`OPENCODE_URL` / `OPENCODE_PASSWORD` environment variables. Endpoints are addressed by **alias
+only**; there is no service discovery.
+
+## Quickstart
+
+```sh
+octl doctor                                    # hard gate: reachability, v2 shape, auth, baseline
+octl create                                    # -> JSON with a ses_... session id
+octl chat -s ses_... --text "your instruction" # async: enqueues and returns immediately
+octl wait -s ses_...                           # blocks up to --timeout (default 300s)
+octl messages -s ses_... --after <cursor>      # incremental read from the last_message_id cursor
+```
+
+`create` always sends an explicit location (the current directory unless `--directory` is given);
+after that every command addresses the session by its `ses_` id. For long or complex prompts, pass
+the body as JSON on stdin (`{"text": ...}`) instead of argv to avoid quote injection.
+
+**Exit codes**
+
+| Code | Status | Meaning |
+| --- | --- | --- |
+| 0 | success | command completed; for `wait`/`chat`, a terminal outcome |
+| 2 | usage | bad invocation or arguments |
+| 3 | `[availability]` | endpoint unreachable / unavailable |
+| 4 | `[compatibility]` | API or version incompatible (requires the v2 API) |
+| 5 | `[other]` | unclassified error |
+| 6 | timeout | `wait`/`chat` timed out; the session may still be generating |
+| 7 | needs_permission | blocked, awaiting permission approval |
+| 8 | needs_form | blocked, awaiting form input |
+
+The `status` field is also always present in the JSON.
+
+## Security model
+
+- **Credentials enter only through the operator channel** (config file / env / `password_command`).
+  The agent surface has no credential arguments and no endpoint-writing verbs.
+- **No URLs on the agent surface** — only aliases; the alias → endpoint mapping lives solely in the
+  operator's config.
+- **No session enumeration** — there is no `list` verb. Pending-interaction queries are scoped to a
+  session subtree and fail closed (empty set) when verification is not possible.
+- **Out of scope:** a malicious agent running as the same user can read the config and opencode
+  state directly. That is the host's permission-gating responsibility, not something the CLI layer
+  can backstop.
 
 ## Docs
 
-- [Connection model, environment variables, cancellation](docs/connection-model.md) · [中文](docs/connection-model.zh-CN.md)
-- [Sessions, agents and model selection](docs/sessions.md) · [中文](docs/sessions.zh-CN.md)
-- [Permission and form flows, permission rules](docs/interactions.md) · [中文](docs/interactions.zh-CN.md)
-- [Subagent-aware waiting in multi-agent sessions](docs/subagent-waiting.md) · [中文](docs/subagent-waiting.zh-CN.md)
-- [Tool reference](docs/tools.md) · [中文](docs/tools.zh-CN.md)
-- [Verified flows and testing](docs/verification.md) · [中文](docs/verification.zh-CN.md)
-- [Live scenario test suites](tests/README.md) · [中文](tests/README.zh-CN.md)
-- [Design record: remote connections](DESIGN-remote-connections.md) · [中文](DESIGN-remote-connections.zh-CN.md)
+- [Design: opencode-ctl (`octl`)](DESIGN-opencode-ctl.md) · [中文](DESIGN-opencode-ctl.zh-CN.md)
+- [Agent skill](skills/octl/SKILL.md) · [中文](skills/octl/SKILL.zh-CN.md)
+- [Testing](tests/README.md) · [中文](tests/README.zh-CN.md)
+- [Historical: design record for remote connections (retired MCP)](DESIGN-remote-connections.md) · [中文](DESIGN-remote-connections.zh-CN.md)

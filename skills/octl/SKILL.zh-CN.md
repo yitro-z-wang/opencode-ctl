@@ -17,7 +17,7 @@ JSON 走 **stdout**，人读日志走 **stderr**，**退出码**即结果类别�
 ```
 octl create                      # 从项目目录运行；或：octl create --directory /绝对路径
 # -> JSON，包含 ses_... 会话 id
-octl chat -s ses_... "你的指令"     # 异步：入队即返回，不阻塞
+octl chat -s ses_... --text "你的指令"   # 异步：入队即返回，不阻塞
 octl wait -s ses_...                # 阻塞，最长到 --timeout（缺省 300s）
 ```
 `create` 总是显式发送 location（缺省为当前目录，可用 `--directory` 覆盖）；此后所有命令只按
@@ -31,7 +31,7 @@ octl permission-reply -s ses_... --request-id per_... --decision always
 octl wait -s ses_...
 ```
 
-**d. 退出码 8 = needs_form。** 按返回的 `needs_form` 载荷填写，用 `octl form-reply -s ses_...`
+**d. 退出码 8 = needs_form。** 按返回的 `needs_form` 载荷填写，用 `octl form-reply -s ses_... --form-id FID`
 提交（结构化字段答案以 stdin 上的 JSON 传入），然后再 `wait`。
 
 **e. 退出码 0 = 成功。** 增量读取新输出：
@@ -70,7 +70,7 @@ octl messages -s ses_... --after <last_message_id>
 | `wait` | 等待终态或需交互状态；`--timeout` 缺省 300s；`--once` = 单次快照＋游标。 |
 | `messages` | 拉取消息；`--after <id>` 只返回新输出及下一个游标。 |
 | `permission-reply` | 回应权限请求：`--request-id` 加 `--decision once\|always\|reject`。 |
-| `form-reply` | 提交表单答案（表单 id 与答案取自载荷）。 |
+| `form-reply` | 提交表单答案：`--form-id` 加 stdin 上的 JSON 答案。 |
 | `pending` | 列出会话子树的待处理权限/表单（非阻塞）。 |
 | `interrupt` | 打断当前进行中的生成。 |
 | `compact` | 压缩会话上下文并等待完成。 |

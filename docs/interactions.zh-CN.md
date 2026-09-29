@@ -1,3 +1,5 @@
+> 为已退役的 MCP 面而写(已被 DESIGN-opencode-ctl.md 取代);交互/会话/子树语义沿用至 octl CLI。
+
 # 权限 / 表单交互流程
 
 [English](interactions.md) | **中文**

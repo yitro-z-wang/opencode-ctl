@@ -1,3 +1,5 @@
+> Historical (superseded 2026-09-30 by DESIGN-opencode-ctl.md) — describes the removed MCP tool surface; kept for the decision record.
+
 # Connection model: MCP-spawned local + multi-server
 
 **English** | [中文](connection-model.zh-CN.md)

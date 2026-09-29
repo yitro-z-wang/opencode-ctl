@@ -19,7 +19,7 @@ version baseline. It does not discover endpoints.
 ```
 octl create                      # runs from the project dir; or: octl create --directory /abs/path
 # -> JSON containing a ses_... id
-octl chat -s ses_... "your instruction"     # async: enqueues and returns immediately
+octl chat -s ses_... --text "your instruction"   # async: enqueues and returns immediately
 octl wait -s ses_...                        # blocks up to --timeout (default 300s)
 ```
 `create` always sends an explicit location (the current directory unless `--directory` is given);
@@ -35,7 +35,7 @@ octl wait -s ses_...
 ```
 
 **d. Exit 8 = needs_form.** Fill the form from the returned `needs_form` payload with
-`octl form-reply -s ses_...` (send structured field answers as JSON on stdin), then `wait` again.
+`octl form-reply -s ses_... --form-id FID` (send structured field answers as JSON on stdin), then `wait` again.
 
 **e. Exit 0 = success.** Read the new output incrementally:
 ```
@@ -74,7 +74,7 @@ The `status` field is also always present in the JSON.
 | `wait` | Wait for a terminal or needs-interaction state; `--timeout` default 300s; `--once` = single snapshot + cursor. |
 | `messages` | Fetch messages; `--after <id>` returns only new output and the next cursor. |
 | `permission-reply` | Answer a permission request: `--request-id` plus `--decision once\|always\|reject`. |
-| `form-reply` | Submit a form's answers (form id and answers from the payload). |
+| `form-reply` | Submit a form's answers: `--form-id` plus the answers as JSON on stdin. |
 | `pending` | List pending permissions/forms for the session subtree (non-blocking). |
 | `interrupt` | Interrupt the generation currently in progress. |
 | `compact` | Compact the session context and wait for completion. |
