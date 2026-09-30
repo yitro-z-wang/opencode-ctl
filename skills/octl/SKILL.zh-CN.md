@@ -19,7 +19,7 @@ octl create                      # 从项目目录运行；或：octl create --d
 octl create --trust "/tmp/opencode/*"   # 仅为本会话预信任 scratch 路径
 # -> JSON，包含 ses_... 会话 id
 octl chat -s ses_... --text "你的指令"   # 异步：入队即返回，不阻塞
-octl wait -s ses_...                # 阻塞，最长到 --timeout（缺省 300s）
+octl wait -s ses_... --timeout 1800 > /tmp/opencode/wait-ses_....json   # 经你的 shell 工具后台运行，绝不前台（见"等待"一节）
 ```
 `create` 总是显式发送 location（缺省为当前目录，可用 `--directory` 覆盖）；此后所有命令只按
 `ses_` id 寻址会话。提示很长或较复杂时，把正文以 **stdin 上的 JSON** 传入，而非放进 argv
@@ -41,14 +41,46 @@ octl messages -s ses_... --after <last_message_id>
 ```
 把 wait/messages JSON 里的 `last_message_id` 作为下一次的游标；不要重读整段会话。
 
-**f. agent 自管轮询。** 不用单次阻塞 wait，改为 `octl wait -s ses_... --once`：返回一次快照
-＋游标后即退出，由你自己循环。
+**f. 没有后台 shell？轮询。** `octl wait -s ses_... --once` 返回一次快照＋游标后立即退出
+（忽略 `--timeout`）。带短睡眠自行循环，直到 `status` 离开 `running`——退出码 0 同样涵盖
+`running`，必须按 JSON 的 `status` 字段分支。后台 wait 输出缺失时，它也是廉价的存活探测。
+
+## 等待——永远在后台
+
+`chat` 只入队；一轮由 `wait` 收口。前台 shell 调用会被你的运行时按命令超时掐断（通常只有
+几分钟），短于中大型轮次——被杀后没有 JSON、没有退出码，轮次仍然打开。因此：
+
+**每一次 `wait`——首次与全部续挂——都必须在后台运行**：走你 shell 工具的后台模式
+（run-in-background bash、后台终端或等价功能），stdout 重定向到文件。`compact` 同为阻塞
+调用，同样处理。
+
+```
+octl wait -s ses_... --timeout 1800 > /tmp/opencode/wait-ses_....json   # 后台
+```
+
+- `--timeout` 是检查点，不是死线：按轮次规模设置（大型轮次 1800–3600s）；退出码 6 表示
+  "仍在生成"，并附 `partial_text` 诊断。
+- 后台调用结束后读文件，按 JSON 的 `status` 字段（始终存在）分发。
+- `succeeded` 隐含整个会话子树（含子 agent）已静默——一个 wait 跟踪全部委派工作。
+
+| 结果 | 动作 |
+|---|---|
+| `succeeded`（0） | 轮次完成——增量读输出：`messages --after <last_message_id>` |
+| `timeout`（6） | 仍在生成——续挂后台 `wait` |
+| `needs_permission`（7） | `permission-reply` 后续挂 |
+| `needs_form`（8） | `form-reply` 后续挂 |
+| `failed` / `interrupted`（5） | 读部分输出，再决策 |
+| 无 JSON / 进程消失 | 按仍在运行处理——`wait --once` 探测后续挂 |
+
+**绝不带着打开的轮次结束回合：**要么已握有经验证的结果，要么后台 wait 存活且收尾消息
+写明（会话 id＋"仍在运行"）。若你的运行环境没有后台模式——或后台完成不通知——改用 §f
+的 `--once` 轮询循环，在回合内一直循环到 `status` 离开 `running`。
 
 ## 退出码
 
 | 码 | status | 含义 |
 |---|---|---|
-| 0 | success | 命令完成；对 wait/chat 表示到达终态 |
+| 0 | success | 命令完成；阻塞式 `wait` 到达终态（`chat` 0 仅表示已入队；`--once` 0 可能仍是 `running`） |
 | 2 | usage | 调用方式或参数错误 |
 | 3 | `[availability]` | 端点不可达 / 不可用 |
 | 4 | `[compatibility]` | API 或版本不兼容（需要 v2 API） |
@@ -68,7 +100,7 @@ octl messages -s ses_... --after <last_message_id>
 | `agents` | 列出 agent 及其解析后的默认模型（只读）。 |
 | `create` | 创建会话；以 cwd 作为 location，`--directory` 可覆盖。`--trust PATTERN`（可重复）为本会话预授权路径。`--model PROVIDER/ID[#variant]` 为本会话固定模型。返回 `ses_` id。 |
 | `chat` | 异步入队一条提示并返回（不阻塞）。 |
-| `wait` | 等待终态或需交互状态；`--timeout` 缺省 300s；`--once` = 单次快照＋游标。 |
+| `wait` | 等待终态或需交互状态；`--timeout` 缺省 300s；`--once` = 单次快照＋游标。务必后台运行——见"等待"一节。 |
 | `messages` | 拉取消息；`--after <id>` 只返回新输出及下一个游标。 |
 | `permission-reply` | 回应权限请求：`--request-id` 加 `--decision once\|always\|reject`。 |
 | `form-reply` | 提交表单答案：`--form-id` 加 stdin 上的 JSON 答案。 |

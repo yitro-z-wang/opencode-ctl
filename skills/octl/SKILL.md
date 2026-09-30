@@ -21,7 +21,7 @@ octl create                      # runs from the project dir; or: octl create --
 octl create --trust "/tmp/opencode/*"   # pre-trust scratch paths for this session only
 # -> JSON containing a ses_... id
 octl chat -s ses_... --text "your instruction"   # async: enqueues and returns immediately
-octl wait -s ses_...                        # blocks up to --timeout (default 300s)
+octl wait -s ses_... --timeout 1800 > /tmp/opencode/wait-ses_....json   # via your shell tool's background mode, never foreground (see "Waiting")
 ```
 `create` always sends an explicit location (the current directory unless `--directory` is given);
 after that, every command addresses the session only by its `ses_` id. For a long or complex
@@ -45,14 +45,51 @@ octl messages -s ses_... --after <last_message_id>
 Use the `last_message_id` from the wait/messages JSON as the next cursor; do not re-read the
 whole conversation.
 
-**f. Agent-managed polling.** Instead of one blocking wait, `octl wait -s ses_... --once`
-returns a single snapshot plus a cursor and exits; loop it yourself.
+**f. No background shell? Poll.** `octl wait -s ses_... --once` returns one snapshot plus
+a cursor and exits immediately (`--timeout` is ignored). Loop it with a short sleep until
+`status` leaves `running` — exit code 0 covers `running` too, so branch on the JSON `status`
+field. Also the cheap liveness probe when a background wait's output is missing.
+
+## Waiting — always in the background
+
+`chat` only enqueues; `wait` closes the round. Foreground shell calls are cut off by your
+runtime's command timeout (usually minutes) — shorter than a medium/large round — leaving no
+JSON, no exit code, and an open round. So:
+
+**Run every `wait` — the first and every re-arm — in the background** through your shell
+tool's background mode (run-in-background bash, background terminal, or equivalent), stdout
+redirected to a file. The same applies to `compact`, which also blocks.
+
+```
+octl wait -s ses_... --timeout 1800 > /tmp/opencode/wait-ses_....json   # background
+```
+
+- `--timeout` is a checkpoint, not a deadline: size it to the round (1800–3600s for large
+  ones); exit 6 means "still running", with `partial_text` diagnostics.
+- When the background call completes, read the file and dispatch on the JSON `status` field
+  (always present).
+- `succeeded` implies the whole session subtree (subagents too) is quiet — one wait tracks
+  all delegated work.
+
+| Outcome | Action |
+|---|---|
+| `succeeded` (0) | round done — read new output: `messages --after <last_message_id>` |
+| `timeout` (6) | still running — re-arm the background `wait` |
+| `needs_permission` (7) | `permission-reply`, then re-arm |
+| `needs_form` (8) | `form-reply`, then re-arm |
+| `failed` / `interrupted` (5) | read the partial output, then decide |
+| no JSON / process vanished | assume still running — probe with `wait --once`, then re-arm |
+
+**Never end a turn with an open round:** either hold the verified outcome, or a background
+wait is live and the closing message says so (session id + "still running"). If your runtime
+has no background mode — or does not notify on completion — use the §f `--once` poll loop
+and keep looping within the turn until `status` leaves `running`.
 
 ## Exit codes
 
 | Code | Status | Meaning |
 |---|---|---|
-| 0 | success | command completed; for wait/chat, a terminal outcome |
+| 0 | success | command completed; blocking `wait` reached a terminal state (`chat` 0 = enqueued only; `--once` 0 may be `running`) |
 | 2 | usage | bad invocation or arguments |
 | 3 | `[availability]` | endpoint unreachable / unavailable |
 | 4 | `[compatibility]` | API or version incompatible (requires the v2 API) |
@@ -72,7 +109,7 @@ The `status` field is also always present in the JSON.
 | `agents` | List agents and their resolved default models (read-only). |
 | `create` | Create a session; sends the cwd as location, `--directory` overrides. `--trust PATTERN` (repeatable) pre-authorizes paths for this session. `--model PROVIDER/ID[#variant]` pins this session's model. Returns a `ses_` id. |
 | `chat` | Enqueue a prompt asynchronously and return (does not block). |
-| `wait` | Wait for a terminal or needs-interaction state; `--timeout` default 300s; `--once` = single snapshot + cursor. |
+| `wait` | Wait for a terminal or needs-interaction state; `--timeout` default 300s; `--once` = single snapshot + cursor. Always run in the background — see "Waiting". |
 | `messages` | Fetch messages; `--after <id>` returns only new output and the next cursor. |
 | `permission-reply` | Answer a permission request: `--request-id` plus `--decision once\|always\|reject`. |
 | `form-reply` | Submit a form's answers: `--form-id` plus the answers as JSON on stdin. |
