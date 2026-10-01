@@ -1127,6 +1127,7 @@ def poll_once(
     gate_message_id=None,
     gate_is_compaction=False,
     gate_created=None,
+    round_gate=None,
     baseline=None,
     with_result=False,
     wait_for_subagents=False,
@@ -1139,18 +1140,32 @@ def poll_once(
     * ``status`` / ``payload``: a terminal / needs-interaction / compaction result, or both None
       meaning "still running, keep polling";
     * ``gate_created``: gate message created timestamp, cached across polls (pass it back in);
+    * ``round_gate``: the round-gate evaluation dict when one was supplied, else None;
     * ``permissions`` / ``forms`` / ``outcome``: this step's root-session view, for timeout diagnostics;
     * ``subtree``: the subtree snapshot when one was computed, else None.
+
+    ``round_gate`` (``{"watermark": float|None, "message_id": str|None}``, at least one set)
+    is the stale-outcome defense for the chat->wait flow: v2 servers keep ``Session.outcome``
+    frozen at the last completed execution while the next one runs, so a terminal outcome is
+    only accepted once ``session.time.idle`` advanced past the pre-prompt watermark AND (when
+    the enqueued message id is known) a ``type:"idle"`` turn-end message exists after it. Both
+    are server-authoritative round markers, not message-shape heuristics.
 
     ``replied_permissions`` is per-wait ephemeral state (ids already auto-replied); the caller owns
     the set and passes it back across polls. This is deliberately not global state.
     """
+    if round_gate and not (
+        round_gate.get("watermark") is not None
+        or round_gate.get("message_id") is not None
+    ):
+        round_gate = None
     if replied_permissions is None:
         replied_permissions = set()
     snapshot = {
         "status": None,
         "payload": None,
         "gate_created": gate_created,
+        "round_gate": None,
         "permissions": [],
         "forms": [],
         "outcome": None,
@@ -1236,6 +1251,39 @@ def poll_once(
     snapshot["outcome"] = outcome
     time_idle = (info.get("time") or {}).get("idle")
 
+    # Round gate (stale-outcome defense). Evaluated before the terminal branch below; the
+    # idle-message confirmation is only fetched once the watermark has advanced, so the
+    # steady-state poll cost is unchanged.
+    if round_gate is not None:
+        watermark = round_gate.get("watermark")
+        rg_message_id = round_gate.get("message_id")
+        watermark_passed = watermark is None or (time_idle or 0) > watermark
+        idle_message_seen = True
+        if rg_message_id is not None:
+            idle_message_seen = False
+            if watermark_passed:
+                try:
+                    rg_msgs = fetch_messages(conn, session_id)
+                except OpenCodeError:
+                    rg_msgs = []
+                gate_index = None
+                for i, m in enumerate(rg_msgs):
+                    if m.get("id") == rg_message_id:
+                        gate_index = i
+                        break
+                if gate_index is not None:
+                    for m in rg_msgs[gate_index + 1:]:
+                        if m.get("type") == "idle":
+                            idle_message_seen = True
+                            break
+        snapshot["round_gate"] = {
+            "watermark": watermark,
+            "message_id": rg_message_id,
+            "time_idle": time_idle,
+            "watermark_passed": watermark_passed,
+            "idle_message_seen": idle_message_seen,
+        }
+
     # Gate message: cache the created timestamp; in the compact case accept its message terminal state directly
     if gate_message_id is not None and gate_created is None:
         try:
@@ -1269,6 +1317,9 @@ def poll_once(
         gate_ok = gate_message_id is None or (
             gate_created is not None and (time_idle or 0) > gate_created
         )
+        if round_gate is not None:
+            rg = snapshot["round_gate"]
+            gate_ok = gate_ok and rg["watermark_passed"] and rg["idle_message_seen"]
         if gate_ok:
             # failed / interrupted are decided outcomes: return immediately, never delayed.
             # A terminal `succeeded` without subtree gating still reports subagent state.
@@ -1417,6 +1468,8 @@ def _timeout_payload(conn, session_id, timeout_secs, baseline, snapshot):
         },
         "note": note,
     }
+    if snapshot.get("round_gate") is not None:
+        payload["diagnostics"]["round_gate"] = snapshot["round_gate"]
     _attach_subtree(payload, snap)
     return payload
 
@@ -1428,6 +1481,7 @@ def run_until_terminal(
     auto_permission="manual",
     gate_message_id=None,
     gate_is_compaction=False,
+    round_gate=None,
     baseline=None,
     with_result=False,
     wait_for_subagents=False,
@@ -1460,6 +1514,7 @@ def run_until_terminal(
             gate_message_id=gate_message_id,
             gate_is_compaction=gate_is_compaction,
             gate_created=gate_created,
+            round_gate=round_gate,
             baseline=baseline,
             with_result=with_result,
             wait_for_subagents=wait_for_subagents,

@@ -72,6 +72,11 @@ octl wait -s ses_... --timeout 1800 > /tmp/opencode/wait-ses_....json   # 后台
 | `failed` / `interrupted`（5） | 读部分输出，再决策 |
 | 无 JSON / 进程消失 | 按仍在运行处理——`wait --once` 探测后续挂 |
 
+**轮次门控信任：** `chat` 会记录轮次门，因此 `wait` 返回的 `succeeded` 一定属于你刚开启的这一轮；
+退出码 6 携带 `diagnostics.round_gate`。该门**仅限本机**——若 `wait` 运行的机器上没有 `chat` 记录的门
+（未记录），则 `chat` 后异常迅速的 `succeeded` 可能是上一轮的陈旧结果：行动前先用
+`messages --after <last_message_id>` 交叉核对。
+
 **绝不带着打开的轮次结束回合：**要么已握有经验证的结果，要么后台 wait 存活且收尾消息
 写明（会话 id＋"仍在运行"）。若你的运行环境没有后台模式——或后台完成不通知——改用 §f
 的 `--once` 轮询循环，在回合内一直循环到 `status` 离开 `running`。

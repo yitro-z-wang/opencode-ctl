@@ -19,6 +19,7 @@ opencode-mcp [文档](../README.zh-CN.md)的一部分。
 8. **取消与并发**:`notifications/cancelled` 在 1 秒内停止轮询;`chat` 在途时并发调用 `pending_interactions` 毫秒级返回。
 9. **宿主集成**:作为工具提供方挂载进 Hermes agent gateway;由 oh-my-opencode-slim 编排框架托管并驱动嵌套 opencode 会话。
 10. **子会话感知等待**:主 agent 后台委派一个卡在 `shell` 审批上的子 agent —— `wait_session`(默认)返回 `needs_permission` 且指向**子会话**的 `session_id`(并带 `root_session_id`),而不是提前的 `succeeded`;`chat`(默认)返回 `succeeded` 但报告 `pending_subagents: 1`。另已验证:三个并行子 agent 各自待审批、子 agent 卡在表单上、`auto_permission="once"` 答复子会话后到达 `succeeded`,以及同样的流程在**远端连接**上不带 `server` 也能正确路由。
+11. **轮次门控（stale-outcome 防御）**: v2 `Session.outcome` 在新一轮运行期间冻结为上一轮结果（已对照 opencode 2.0.18 源码与实机验证；2.0.21 未变），导致第 2 轮起的 `chat`→`wait` 返回上一轮的 `succeeded` 与旧文本。现由 `chat` 记录本机轮次门（`rounds` 表：提交前的 `session.time.idle` 水位线＋入队 prompt id），`wait` 仅在 `time.idle` 越过水位线**且** prompt 消息之后出现 `type:"idle"` 轮末消息时才接受终态。离线已验证（FakeOpenCode 模拟冻结语义）：陈旧 `succeeded` → 退出码 6 且携带 `diagnostics.round_gate`（`watermark_passed=false`）；陈旧 `failed` 不再外泄；仅有水位线推进而无本轮 idle 标记不被接受；`--once` 报告 `round_open` 并在终态关闭行；无门时的 legacy 降级保持不变。已在 2.0.18 实机验证：第 2 轮 `wait` 返回第 2 轮标记文本（而非陈旧的第 1 轮结果），生成中的 `--once` 报告 `running`。
 
 ## 测试
 

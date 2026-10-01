@@ -115,14 +115,24 @@ Retained mapping: `doctor` `endpoints` `agents` `create` `chat` `wait` `messages
 
 - **Output**: JSON→stdout, human logs→stderr; exit codes: 0 success / 2 usage / 3 `[availability]` / 4 `[compatibility]` / 5 `[other]` / 6 timeout / 7 needs_permission / 8 needs_form. The `status` field is always in the JSON too;
 - **`chat`**: enqueue asynchronously and return (v2 prompt semantics), does not block; complex/long text parameters go through stdin JSON (prevents quote injection);
-- **`wait`**: `--timeout` default **300s** (blocking long-poll, loops within a single process); `--once` = single snapshot + cursor (the agent manages its own loop); **manual permission mode only, no automatic answering of any kind** — permissions must be approved by the agent. The skill explicitly instructs: answer `always` to safe requests to reduce turns;
+- **`wait`**: `--timeout` default **300s** (blocking long-poll, loops within a single process); `--once` = single snapshot + cursor (the agent manages its own loop); **manual permission mode only, no automatic answering of any kind** — permissions must be approved by the agent. The skill explicitly instructs: answer `always` to safe requests to reduce turns; terminal determination is **round-gated** (see below), never a bare `outcome` read;
 - **`pending` / pending-type queries**: subtree-scoped (precise idset membership filtering over the `parentID` tree; a subagent request is reported to the parent-session controller, with the payload carrying the real owner `sessionID`); fall back to the per-session endpoint when the global endpoint is unavailable; failing that, `verified=false` empty set, fail closed;
 - **`permission-reply` / `form-reply`**: addressed within the session (the `/api/session/{sid}/permission/{rid}/reply` path itself is bound to the session);
 - **pre-trust path**: Resolved (2026-09-30): `octl create --trust` via the session-create `permissions` ruleset — caller-declared, session-lifetime scope, narrower and more auditable than persistent always-saves.
 
+### Round gating (stale-outcome defense)
+
+v2 `Session.outcome` is documented as the "Outcome of the last completed execution": it has **no running value**, is **not reset** when a new prompt is enqueued or a generation starts, and is rewritten only at the terminal transition, together with a monotonic `time.idle` bump (`time_idle = max(now, old+1)`); each completed turn also appends a `type:"idle"` message carrying the outcome. So after any completed turn, a bare `outcome == "succeeded"` is stale for the **entire** duration of the next run — the 2nd+ chat→wait round used to return the previous round's result.
+
+- `chat` records a per-session **round gate** in the state DB (see Route cache): the pre-submit `session.time.idle` watermark plus the enqueued prompt's message id (the prompt response `id`), best-effort and **machine-local**; a later `chat` overwrites it.
+- `wait` / `wait --once` load that gate automatically. An `outcome` in {`succeeded`, `failed`, `interrupted`} counts as terminal **only** when (a) `session.time.idle` strictly advanced past the watermark **and** (b) when the gate message id is known, a `type:"idle"` turn-end message exists after it. Both are **server-authoritative durable markers, not message-shape heuristics** (the design history removed shape heuristics; this gates on round boundaries instead). Until the gate passes, wait keeps polling (`running`, eventually exit 6 timeout).
+- Exit-6 timeout JSON adds `diagnostics.round_gate = {watermark, message_id, time_idle, watermark_passed, idle_message_seen}`; the `--once` running payload adds `round_open: true` and the same `round_gate`.
+- The round row is closed on a terminal outcome (`succeeded`/`failed`/`interrupted`) or session delete.
+- **Transitional fallback**: when chat and wait run on different machines, or no gate was recorded, wait keeps the legacy semantics — it trusts the raw `outcome`, which can be the previous round's stale value.
+
 ### Route cache
 
-`~/.local/state/octl/routes.db` (**sqlite**, table `routes(ses_ TEXT PRIMARY KEY, endpoint TEXT, created_at)`). Written at `create`; subsequent commands resolve the endpoint automatically by ses_; on a miss, error asking for an explicit `--endpoint`. sqlite rather than JSON+atomic write: transactions and corruption detection are built in, minimizing corruption probability and rebuild logic.
+`~/.local/state/octl/routes.db` (**sqlite**). Two tables: `routes(ses_ TEXT PRIMARY KEY, endpoint TEXT, created_at)` and `rounds` (per-session round gate: `time.idle` watermark + enqueued prompt message id). The route row is written at `create`; subsequent commands resolve the endpoint automatically by ses_; on a miss, error asking for an explicit `--endpoint`. The round row is written at `chat` (best-effort) and read/closed by `wait`. sqlite rather than JSON+atomic write: transactions and corruption detection are built in, minimizing corruption probability and rebuild logic.
 
 ### Version policy
 

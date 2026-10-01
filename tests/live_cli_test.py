@@ -10,9 +10,11 @@ This harness (not ``octl``) spawns ``opencode serve`` on a free port with a
 random ``OPENCODE_SERVER_PASSWORD``, waits for readiness, writes a temporary
 ``endpoints.toml`` into a throwaway ``XDG_CONFIG_HOME`` and then drives the CLI
 through the normal agent loop: ``doctor`` -> ``create`` -> ``chat`` (async) ->
-``wait`` -> ``messages --after`` -> ``delete``. Every step asserts the exit code
-and the JSON keys, and every step asserts that the server password never leaks
-into stdout+stderr. ``api_version_warning`` is tolerated when present.
+``wait`` -> ``messages --after`` -> ``delete``, then a two-round smoke where a
+second ``chat`` with a unique marker must return the second round's text (never
+the stale first-round outcome). Every step asserts the exit code and the JSON
+keys, and every step asserts that the server password never leaks into
+stdout+stderr. ``api_version_warning`` is tolerated when present.
 
 The whole suite reports SKIP (exit 0) when ``opencode`` is not on PATH. See
 ``tests/README.md``.
@@ -266,6 +268,35 @@ def run(reporter, harness):
         and isinstance(messages_payload.get("messages"), list)
         and "last_message_id" in messages_payload,
         "rc=%s count=%s" % (messages.returncode, (messages_payload or {}).get("count")),
+    )
+
+    # Round gate regression: a second turn must never come back as the first turn's
+    # stale succeeded outcome with the previous round's text.
+    marker = "OCTL-ROUND2-MARKER-" + secrets.token_hex(4)
+    chat2 = harness.run(["chat", "-s", harness.session_id, "--endpoint", "local",
+                         "--text", "Reply with exactly: " + marker])
+    chat2_payload = parse_json(chat2)
+    once = harness.run(["wait", "-s", harness.session_id, "--endpoint", "local", "--once"])
+    once_payload = parse_json(once)
+    once_ok = once.returncode == 0 and once_payload is not None
+    if once_ok and once_payload.get("status") == "succeeded":
+        # If the single poll already claims success it must be this round's text.
+        once_ok = marker in (once_payload.get("assistant_text") or "")
+    wait2 = harness.run(["wait", "-s", harness.session_id, "--endpoint", "local", "--timeout", "240"])
+    wait2_payload = parse_json(wait2)
+    text2 = (wait2_payload or {}).get("assistant_text") or ""
+    reporter.check(
+        "wait: round 2 returns the new turn's text (not the stale round-1 outcome)",
+        chat2.returncode == 0
+        and (chat2_payload or {}).get("status") == "submitted"
+        and once_ok
+        and wait2.returncode == 0
+        and (wait2_payload or {}).get("status") == "succeeded"
+        and marker in text2,
+        "chat2_rc=%s once_rc=%s/%s wait2_rc=%s/%s text2=%r" % (
+            chat2.returncode, once.returncode, (once_payload or {}).get("status"),
+            wait2.returncode, (wait2_payload or {}).get("status"), text2[-80:],
+        ),
     )
 
     delete = harness.run(["delete", "-s", harness.session_id])

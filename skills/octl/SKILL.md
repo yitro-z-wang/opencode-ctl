@@ -80,6 +80,12 @@ octl wait -s ses_... --timeout 1800 > /tmp/opencode/wait-ses_....json   # backgr
 | `failed` / `interrupted` (5) | read the partial output, then decide |
 | no JSON / process vanished | assume still running — probe with `wait --once`, then re-arm |
 
+**Round-gated trust:** `chat` records a round gate, so a `succeeded` from `wait` always belongs to
+the round you just started; exit 6 carries `diagnostics.round_gate`. The gate is **machine-local** —
+if `wait` runs where `chat` did not (no gate recorded), a suspiciously fast `succeeded` right after
+`chat` may be the previous round's stale outcome: cross-check with `messages --after <last_message_id>`
+before acting on it.
+
 **Never end a turn with an open round:** either hold the verified outcome, or a background
 wait is live and the closing message says so (session id + "still running"). If your runtime
 has no background mode — or does not notify on completion — use the §f `--once` poll loop

@@ -56,7 +56,7 @@ from octl_core import (  # noqa: E402
     unwrap,
 )
 
-OCTL_VERSION = "1.0.0"
+OCTL_VERSION = "1.1.0"
 
 # --- Exit codes (DESIGN §5) -------------------------------------------------
 EXIT_OK = 0
@@ -332,6 +332,13 @@ def _open_routes():
         "endpoint TEXT NOT NULL, "
         "created_at TEXT NOT NULL DEFAULT (datetime('now')))"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rounds ("
+        "ses TEXT PRIMARY KEY, "
+        "watermark REAL, "
+        "gate_message_id TEXT, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
     conn.commit()
     return conn
 
@@ -387,6 +394,60 @@ def forget_route(session_id):
         conn = _open_routes()
         try:
             conn.execute("DELETE FROM routes WHERE ses = ?", (session_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def record_round(session_id, watermark, gate_message_id):
+    """Best-effort record of the session's open round gate (stale-outcome defense).
+
+    ``watermark`` is session.time.idle read just before the prompt was submitted;
+    ``gate_message_id`` is the id returned by POST /prompt. A later ``wait`` on the
+    same machine loads this row and refuses stale outcomes until the round really
+    ended. Never fatal: on failure, wait falls back to raw-outcome semantics.
+    """
+    if not session_id or (watermark is None and gate_message_id is None):
+        return
+    try:
+        conn = _open_routes()
+        try:
+            conn.execute(
+                "INSERT INTO rounds (ses, watermark, gate_message_id) VALUES (?, ?, ?) "
+                "ON CONFLICT(ses) DO UPDATE SET watermark=excluded.watermark, "
+                "gate_message_id=excluded.gate_message_id, created_at=datetime('now')",
+                (session_id, watermark, gate_message_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def lookup_round(session_id):
+    """Return (watermark, gate_message_id) for the session's open round, or None."""
+    try:
+        conn = _open_routes()
+        try:
+            row = conn.execute(
+                "SELECT watermark, gate_message_id FROM rounds WHERE ses = ?",
+                (session_id,),
+            ).fetchone()
+            return (row[0], row[1]) if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def close_round(session_id):
+    try:
+        conn = _open_routes()
+        try:
+            conn.execute("DELETE FROM rounds WHERE ses = ?", (session_id,))
             conn.commit()
         finally:
             conn.close()
@@ -732,6 +793,19 @@ def cmd_chat(args, config):
         raise UsageError('missing prompt text; pass --text or JSON {"text": ...} on stdin')
     if not isinstance(text, str) or not text:
         raise UsageError("prompt text must be a non-empty string")
+    # Round gate: read session.time.idle BEFORE submitting, so a later wait can tell
+    # "a new terminal transition happened" from the previous round's frozen outcome.
+    try:
+        info = unwrap(http_request(
+            conn,
+            "GET",
+            "/api/session/%s" % urllib.parse.quote(session_id, safe=""),
+        ))
+        watermark = (
+            (info.get("time") or {}).get("idle") if isinstance(info, dict) else None
+        )
+    except Exception:
+        watermark = None
     payload = unwrap(http_request(
         conn,
         "POST",
@@ -740,6 +814,7 @@ def cmd_chat(args, config):
     ))
     gate_id = payload.get("id") if isinstance(payload, dict) else None
     record_route(session_id, conn.name)
+    record_round(session_id, watermark, gate_id)
     emit(maybe_warn(conn, {
         "status": "submitted",
         "server": conn.name,
@@ -767,6 +842,9 @@ def _once_payload(conn, session_id, snapshot):
         "pending_permissions": len(snapshot.get("permissions") or []),
         "pending_forms": len(snapshot.get("forms") or []),
     }
+    if snapshot.get("round_gate") is not None:
+        payload["round_open"] = True
+        payload["round_gate"] = snapshot["round_gate"]
     if snapshot.get("subtree") is not None:
         _attach_subtree(payload, snapshot["subtree"])
     return payload
@@ -777,27 +855,39 @@ def cmd_wait(args, config):
     endpoint = resolve_endpoint(args, config, session_id=session_id)
     conn = endpoint.connection()
     record_route(session_id, conn.name)
+    round_row = lookup_round(session_id)
+    round_gate = None
+    if round_row is not None and (
+        round_row[0] is not None or round_row[1] is not None
+    ):
+        round_gate = {"watermark": round_row[0], "message_id": round_row[1]}
     if args.once:
         snapshot = poll_once(
             conn,
             session_id,
             auto_permission="manual",
+            round_gate=round_gate,
             with_result=True,
             wait_for_subagents=True,
         )
         payload = _once_payload(conn, session_id, snapshot)
         emit(maybe_warn(conn, payload))
+        if payload.get("status") in ("succeeded", "failed", "interrupted"):
+            close_round(session_id)
         return exit_for_status(payload.get("status"))
     status, payload = run_until_terminal(
         conn,
         session_id,
         args.timeout,
         auto_permission="manual",
+        round_gate=round_gate,
         with_result=True,
         wait_for_subagents=True,
         cancel_check=None,
     )
     emit(maybe_warn(conn, payload))
+    if status in ("succeeded", "failed", "interrupted"):
+        close_round(session_id)
     return exit_for_status(status)
 
 
@@ -1004,6 +1094,7 @@ def cmd_delete(args, config):
         "/api/session/%s" % urllib.parse.quote(session_id, safe=""),
     )
     forget_route(session_id)
+    close_round(session_id)
     emit(maybe_warn(conn, {"ok": True, "server": conn.name, "session_id": session_id}))
     return EXIT_OK
 

@@ -13,8 +13,9 @@ parsing (TOML, ``password_command``, loose-permission warning), the routes
 database (write / lookup / miss), URL-as-alias rejection, the ``OpenCodeError``
 kind -> exit-code mapping (monkeypatched), stdin JSON argument handling, the
 create permission pre-trust surface (``--trust`` expansion, stdin merge order,
-omission when unused, and the ``--model`` per-session pin) and the credential non-leak invariant in a wrong-password
-run.
+omission when unused, and the ``--model`` per-session pin), the credential
+non-leak invariant in a wrong-password run, and five round-gate (stale-outcome
+defense) scenarios driven by a ``POST /__test/complete`` control endpoint.
 
 Each scenario prints PASS/FAIL; the process exits 1 when any scenario fails.
 See ``tests/README.md``.
@@ -29,7 +30,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
+import urllib.request
 import http.server
 from importlib.machinery import SourceFileLoader
 
@@ -47,11 +50,24 @@ OCTL_PATH = os.path.join(REPO_ROOT, "octl")
 # ---------------------------------------------------------------------------
 
 class FakeOpenCode:
+    """v2-shaped fake whose ``Session.outcome`` stays frozen across a new prompt.
+
+    Per session the fake tracks a ``messages`` list, a monotonic ``time_idle``
+    (ms float) watermark and the last completed turn's ``idle_outcome``. A prompt
+    records its message id but never touches ``time_idle`` / ``idle_outcome`` --
+    exactly the v2 behaviour that makes a bare ``outcome`` stale for the whole
+    next run. The ``POST /__test/complete`` control endpoint performs the terminal
+    transition (append messages + bump ``time.idle``), optionally ``bump_only``
+    to model a foreign turn advancing the watermark without our round's idle
+    marker.
+    """
+
     def __init__(self, password=None, version="2.0.12"):
         self.password = password
         self.version = version
         self.requests = []
         self._lock = threading.Lock()
+        self._sessions = {}
         handler = self._make_handler()
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -65,6 +81,95 @@ class FakeOpenCode:
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+
+    # -- per-session state (call with self._lock held unless noted) ----------
+    def _st(self, sid):
+        state = self._sessions.get(sid)
+        if state is None:
+            state = {
+                "messages": [],
+                "time_idle": 1000.0,
+                "idle_outcome": None,
+                "prompt_count": 0,
+                "last_prompt_id": None,
+                "last_prompt_text": None,
+            }
+            self._sessions[sid] = state
+        return state
+
+    def _record_prompt(self, sid, text):
+        with self._lock:
+            state = self._st(sid)
+            state["prompt_count"] += 1
+            pid = "msg_prompt_%d" % state["prompt_count"]
+            state["last_prompt_id"] = pid
+            state["last_prompt_text"] = text if isinstance(text, str) else ""
+            return pid
+
+    def _session_view(self, sid):
+        with self._lock:
+            state = self._st(sid)
+            return {
+                "id": sid,
+                "title": "fake",
+                "outcome": state["idle_outcome"],
+                "time": {"idle": state["time_idle"], "created": 0, "updated": 0},
+            }
+
+    def _messages_view(self, sid, order="desc", limit=None):
+        with self._lock:
+            msgs = list(self._st(sid)["messages"])
+        if order == "desc":
+            msgs = list(reversed(msgs))
+        if limit is not None:
+            try:
+                msgs = msgs[: int(limit)]
+            except (TypeError, ValueError):
+                pass
+        return msgs
+
+    def _complete(self, sid, outcome, text, mode):
+        """Terminal transition: mode ``full`` appends messages, ``bump_only`` only bumps."""
+        with self._lock:
+            state = self._st(sid)
+            now = int(time.time() * 1000)
+            if mode == "full":
+                pid = state.get("last_prompt_id") or "msg_prompt_0"
+                count = len(state["messages"])
+                state["messages"].append({
+                    "id": pid,
+                    "type": "user",
+                    "text": state.get("last_prompt_text") or "",
+                    "time": {"created": now},
+                })
+                state["messages"].append({
+                    "id": "msg_asst_%d" % (count + 1),
+                    "type": "assistant",
+                    "agent": "build",
+                    "model": "fake/model",
+                    "time": {"created": now, "completed": now},
+                    "content": [{"type": "text", "text": text}],
+                })
+                state["messages"].append({
+                    "id": "msg_idle_%d" % (count + 3),
+                    "type": "idle",
+                    "outcome": outcome,
+                })
+            state["time_idle"] = max(float(now), state["time_idle"] + 1.0)
+            state["idle_outcome"] = outcome
+
+    def complete(self, sid, outcome="succeeded", text="", mode="full"):
+        """Drive the /__test/complete control endpoint from the test process."""
+        request = urllib.request.Request(
+            self.url + "/__test/complete",
+            data=json.dumps({
+                "sid": sid, "outcome": outcome, "text": text, "mode": mode,
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
 
     def last(self, method=None, suffix=None):
         with self._lock:
@@ -110,6 +215,9 @@ class FakeOpenCode:
             def _path(self):
                 return urllib.parse.urlsplit(self.path).path
 
+            def _query(self):
+                return urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+
             def do_GET(self):
                 self._record(None)
                 if not self._auth_ok():
@@ -127,10 +235,17 @@ class FakeOpenCode:
                         {"name": "build", "mode": "primary", "model": None}
                     ]})
                 elif path.endswith("/message"):
-                    self._respond(200, {"messages": []})
+                    sid = path.split("/api/session/", 1)[1].rsplit("/message", 1)[0]
+                    query = self._query()
+                    order = (query.get("order") or ["asc"])[0]
+                    limit = (query.get("limit") or [None])[0]
+                    messages = outer._messages_view(
+                        urllib.parse.unquote(sid), order=order, limit=limit
+                    )
+                    self._respond(200, {"messages": messages})
                 elif path.startswith("/api/session/"):
-                    sid = path.split("/api/session/", 1)[1]
-                    self._respond(200, {"id": sid, "title": "fake"})
+                    sid = urllib.parse.unquote(path.split("/api/session/", 1)[1])
+                    self._respond(200, outer._session_view(sid))
                 else:
                     self._respond(404, {"error": "not found"})
 
@@ -142,15 +257,32 @@ class FakeOpenCode:
                 except ValueError:
                     body = None
                 self._record(body)
+                path = self._path()
+                if path == "/__test/complete":
+                    # Harness-only control endpoint: bypasses endpoint auth by design.
+                    fields = body if isinstance(body, dict) else {}
+                    sid = fields.get("sid")
+                    if sid:
+                        outer._complete(
+                            sid,
+                            fields.get("outcome", "succeeded"),
+                            fields.get("text", ""),
+                            fields.get("mode", "full"),
+                        )
+                    self._respond(200, {"ok": True})
+                    return
                 if not self._auth_ok():
                     self._respond(401, {"error": "unauthorized"})
                     return
-                path = self._path()
                 if path == "/api/session":
                     title = (body or {}).get("title")
                     self._respond(200, {"id": "ses_test123", "title": title})
                 elif path.endswith("/prompt"):
-                    self._respond(200, {"id": "msg_prompt_1"})
+                    sid = urllib.parse.unquote(
+                        path.split("/api/session/", 1)[1].rsplit("/prompt", 1)[0]
+                    )
+                    prompt_id = outer._record_prompt(sid, (body or {}).get("text"))
+                    self._respond(200, {"id": prompt_id})
                 elif path.endswith("/interrupt"):
                     self._respond(200, {})
                 elif path.endswith("/reply"):
@@ -607,6 +739,204 @@ def scenario_credential_non_leak(reporter):
         box.close()
 
 
+def _gate_config(box, server, password):
+    box.write_config(
+        'default = "main"\n'
+        '[endpoints.main]\n'
+        'url = "%s"\n'
+        'password = "%s"\n'
+        % (server.url, password)
+    )
+
+
+GATE_SID = "ses_test123"
+
+
+def scenario_round_gate_stale_succeeded(reporter):
+    name = "round gate: stale succeeded is not returned before the new round ends"
+    box = Sandbox()
+    server = FakeOpenCode(password="gatepw")
+    try:
+        _gate_config(box, server, "gatepw")
+        sid = GATE_SID
+        # Turn 1 runs to completion, so the fake's outcome is now "succeeded" and frozen.
+        c1 = box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn one"])
+        server.complete(sid, outcome="succeeded", text="reply one", mode="full")
+        w1 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "5"])
+
+        # Turn 2 is enqueued: v2 keeps outcome=succeeded and time.idle frozen, so a bare
+        # outcome check would return the previous round immediately (the original bug).
+        c2 = box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn two"])
+        w2 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "2"])
+        p2 = parse_json(w2)
+        rg2 = ((p2 or {}).get("diagnostics") or {}).get("round_gate") or {}
+
+        server.complete(sid, outcome="succeeded", text="reply two ROUND2-MARKER", mode="full")
+        w3 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "5"])
+        p3 = parse_json(w3)
+        reporter.check(
+            name,
+            c1.returncode == 0
+            and w1.returncode == 0
+            and c2.returncode == 0
+            and w2.returncode == 6
+            and (p2 or {}).get("status") == "timeout"
+            and rg2.get("watermark_passed") is False
+            and w3.returncode == 0
+            and (p3 or {}).get("status") == "succeeded"
+            and "ROUND2-MARKER" in ((p3 or {}).get("assistant_text") or "")
+            and "diagnostics" not in (p3 or {}),
+            "c1=%s w1=%s c2=%s w2=%s rg=%s w3=%s text=%r" % (
+                c1.returncode, w1.returncode, c2.returncode, w2.returncode,
+                json.dumps(rg2), w3.returncode, ((p3 or {}).get("assistant_text") or "")[-60:],
+            ),
+        )
+    finally:
+        server.close()
+        box.close()
+
+
+def scenario_round_gate_stale_failed(reporter):
+    name = "round gate: stale failed is not returned before the new round ends"
+    box = Sandbox()
+    server = FakeOpenCode(password="gatepw")
+    try:
+        _gate_config(box, server, "gatepw")
+        sid = GATE_SID
+        # Turn 1 ended failed; turn 2 must never inherit that decision.
+        c1 = box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn one"])
+        server.complete(sid, outcome="failed", text="failed one", mode="full")
+        c2 = box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn two"])
+        w2 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "2"])
+        p2 = parse_json(w2)
+
+        server.complete(sid, outcome="succeeded", text="reply two", mode="full")
+        w3 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "5"])
+        p3 = parse_json(w3)
+        reporter.check(
+            name,
+            c1.returncode == 0
+            and c2.returncode == 0
+            and w2.returncode == 6
+            and w2.returncode != 5  # a stale failed must not surface as failed
+            and (p2 or {}).get("status") == "timeout"
+            and w3.returncode == 0
+            and (p3 or {}).get("status") == "succeeded",
+            "c1=%s c2=%s w2=%s p2=%s w3=%s p3=%s" % (
+                c1.returncode, c2.returncode, w2.returncode, (p2 or {}).get("status"),
+                w3.returncode, (p3 or {}).get("status"),
+            ),
+        )
+    finally:
+        server.close()
+        box.close()
+
+
+def scenario_round_gate_legacy_fallback(reporter):
+    name = "round gate: no recorded round falls back to the raw outcome"
+    box = Sandbox()
+    server = FakeOpenCode(password="gatepw")
+    try:
+        _gate_config(box, server, "gatepw")
+        sid = GATE_SID
+        # Completed turn, but no `chat` ever recorded a rounds row in this fresh state dir.
+        server.complete(sid, outcome="succeeded", text="legacy reply", mode="full")
+        w = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "2"])
+        payload = parse_json(w)
+        reporter.check(
+            name,
+            w.returncode == 0
+            and (payload or {}).get("status") == "succeeded"
+            and "legacy reply" in ((payload or {}).get("assistant_text") or "")
+            and "diagnostics" not in (payload or {}),
+            "rc=%s status=%s" % (w.returncode, (payload or {}).get("status")),
+        )
+    finally:
+        server.close()
+        box.close()
+
+
+def scenario_round_gate_idle_message(reporter):
+    name = "round gate: watermark advance without our idle marker is not enough"
+    box = Sandbox()
+    server = FakeOpenCode(password="gatepw")
+    try:
+        _gate_config(box, server, "gatepw")
+        sid = GATE_SID
+        box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn one"])
+        server.complete(sid, outcome="succeeded", text="reply one", mode="full")
+        w1 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "5"])
+
+        c2 = box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn two"])
+        # A foreign turn bumps the watermark but leaves no idle message after our gate id.
+        server.complete(sid, outcome="succeeded", text="", mode="bump_only")
+        w2 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "2"])
+        p2 = parse_json(w2)
+        rg2 = ((p2 or {}).get("diagnostics") or {}).get("round_gate") or {}
+
+        server.complete(sid, outcome="succeeded", text="reply two", mode="full")
+        w3 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "5"])
+        reporter.check(
+            name,
+            w1.returncode == 0
+            and c2.returncode == 0
+            and w2.returncode == 6
+            and rg2.get("watermark_passed") is True
+            and rg2.get("idle_message_seen") is False
+            and w3.returncode == 0,
+            "w1=%s c2=%s w2=%s rg=%s w3=%s" % (
+                w1.returncode, c2.returncode, w2.returncode, json.dumps(rg2), w3.returncode,
+            ),
+        )
+    finally:
+        server.close()
+        box.close()
+
+
+def scenario_round_gate_once(reporter):
+    name = "round gate: --once reports the open round, then closes it on terminal"
+    box = Sandbox()
+    server = FakeOpenCode(password="gatepw")
+    try:
+        _gate_config(box, server, "gatepw")
+        sid = GATE_SID
+        box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn one"])
+        server.complete(sid, outcome="succeeded", text="reply one", mode="full")
+        w1 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "5"])
+
+        box.run(["chat", "-s", sid, "--endpoint", "main", "--text", "turn two"])
+        o1 = box.run(["wait", "-s", sid, "--endpoint", "main", "--once"])
+        p1 = parse_json(o1)
+
+        server.complete(sid, outcome="succeeded", text="reply two", mode="full")
+        o2 = box.run(["wait", "-s", sid, "--endpoint", "main", "--once"])
+        p2 = parse_json(o2)
+        # The terminal --once must have deleted the rounds row: a following blocking wait
+        # therefore uses the documented legacy fallback and still exits 0.
+        w3 = box.run(["wait", "-s", sid, "--endpoint", "main", "--timeout", "5"])
+        p3 = parse_json(w3)
+        reporter.check(
+            name,
+            w1.returncode == 0
+            and o1.returncode == 0
+            and (p1 or {}).get("status") == "running"
+            and (p1 or {}).get("round_open") is True
+            and isinstance((p1 or {}).get("round_gate"), dict)
+            and (p1 or {}).get("round_gate", {}).get("watermark_passed") is False
+            and o2.returncode == 0
+            and (p2 or {}).get("status") == "succeeded"
+            and w3.returncode == 0
+            and (p3 or {}).get("status") == "succeeded",
+            "w1=%s o1=%s p1=%s/%s o2=%s p2=%s w3=%s p3=%s" % (
+                w1.returncode, o1.returncode, (p1 or {}).get("status"), (p1 or {}).get("round_open"),
+                o2.returncode, (p2 or {}).get("status"), w3.returncode, (p3 or {}).get("status"),
+            ),
+        )
+    finally:
+        server.close()
+        box.close()
+
+
 SCENARIOS = [
     scenario_config_and_endpoints,
     scenario_password_command,
@@ -617,6 +947,11 @@ SCENARIOS = [
     scenario_stdin_json,
     scenario_create_permissions,
     scenario_credential_non_leak,
+    scenario_round_gate_stale_succeeded,
+    scenario_round_gate_stale_failed,
+    scenario_round_gate_legacy_fallback,
+    scenario_round_gate_idle_message,
+    scenario_round_gate_once,
 ]
 
 

@@ -115,14 +115,24 @@ CLI 面仅有:`endpoints`(枚举别名+URL+版本基准状态,不探活)、`endp
 
 - **输出**:JSON→stdout,人读日志→stderr;退出码:0 成功 / 2 用法 / 3 `[availability]` / 4 `[compatibility]` / 5 `[other]` / 6 超时 / 7 needs_permission / 8 needs_form。`status` 字段始终同时在 JSON 里;
 - **`chat`**:异步入队即返回(v2 prompt 语义),不阻塞;复杂/长文本参数走 stdin JSON(防引号注入);
-- **`wait`**:`--timeout` 缺省 **300s**(阻塞长轮询,单进程内循环);`--once` = 单次快照+游标(agent 自管循环模式);**只有 manual 权限模式,不存在任何自动代答**——权限必须由 agent 审批。skills 明确指引:对安全请求回应 `always` 以减少轮次;
+- **`wait`**:`--timeout` 缺省 **300s**(阻塞长轮询,单进程内循环);`--once` = 单次快照+游标(agent 自管循环模式);**只有 manual 权限模式,不存在任何自动代答**——权限必须由 agent 审批。skills 明确指引:对安全请求回应 `always` 以减少轮次;终态判定为**轮次门控**(见下),绝不裸读 `outcome`;
 - **`pending` / `pending` 类查询**:子树作用域(`parentID` 树 idset 精确成员过滤,子 agent 请求上报给父会话控制者,payload 带真实属主 `sessionID`);全局端点不可用回退逐会话端点;再不行 `verified=false` 空集失败关闭;
 - **`permission-reply` / `form-reply`**:会话内寻址(`/api/session/{sid}/permission/{rid}/reply` 路径本身绑定会话);
 - **预信任路径**:已解决(2026-09-30):`octl create --trust` 经 POST /api/session 的 `permissions: Permission.Ruleset` 实现——caller 声明、会话作用域、随会话消亡,比 always 沉淀的持久项目规则更窄且在 transcript 可审计。
 
+### 轮次门控(stale-outcome 防御)
+
+v2 的 `Session.outcome` 文档定义为"最近一次已完成执行的 Outcome":它**没有 running 值**,新提示入队或新一代开始时**不重置**,只在终态跃迁时改写,同时单调递增 `time.idle`(`time_idle = max(now, old+1)`);每个完成的轮次还会追加一条携带 outcome 的 `type:"idle"` 消息。因此任何已完成轮次之后,裸读 `outcome == "succeeded"` 在**下一整轮**期间都是陈旧的——第二次及以后的 chat→wait 轮次会返回上一轮的结果。
+
+- `chat` 在状态库中记录每会话的**轮次门(round gate)**(见"路由缓存"):提交前的 `session.time.idle` 水位 + 入队提示的消息 id(prompt 响应的 `id`),尽力而为且**仅限本机**;后一次 `chat` 覆盖之。
+- `wait` / `wait --once` 自动载入该门。`outcome` 属于 {`succeeded`、`failed`、`interrupted`} 时,**只有**满足以下条件才算终态:(a) `session.time.idle` 严格越过水位,**且**(b) 已知门消息 id 时,消息列表中存在位于其后的 `type:"idle"` 轮末消息。两者都是**服务端权威的持久标记,而非消息形状启发式**(设计史已移除形状启发式;这里门控的是轮次边界而非消息形状)。门通过之前,wait 持续轮询(`running`,最终退出码 6 超时)。
+- 退出码 6 的超时 JSON 追加 `diagnostics.round_gate = {watermark, message_id, time_idle, watermark_passed, idle_message_seen}`;`--once` 的 running 载荷追加 `round_open: true` 与同形状的 `round_gate`。
+- 轮次行在终态 outcome(`succeeded`/`failed`/`interrupted`)或会话删除时关闭。
+- **过渡期回退**:chat 与 wait 分处不同机器、或未记录门时,wait 保持旧语义——直接信任原始 `outcome`,它可能是上一轮的陈旧值。
+
 ### 路由缓存
 
-`~/.local/state/octl/routes.db`(**sqlite**,表 `routes(ses_ TEXT PRIMARY KEY, endpoint TEXT, created_at)`)。`create` 时写入,后续命令按 ses_ 自动解析端点;miss 则报错要求显式 `--endpoint`。选 sqlite 而非 JSON+原子写:事务与损坏检测内建,损坏概率与重建逻辑最小化。
+`~/.local/state/octl/routes.db`(**sqlite**)。两张表:`routes(ses_ TEXT PRIMARY KEY, endpoint TEXT, created_at)` 与 `rounds`(每会话轮次门:`time.idle` 水位 + 入队提示消息 id)。路由行在 `create` 时写入;后续命令按 ses_ 自动解析端点;miss 则报错要求显式 `--endpoint`。轮次行在 `chat` 时写入(尽力而为),由 `wait` 读取/关闭。选 sqlite 而非 JSON+原子写:事务与损坏检测内建,损坏概率与重建逻辑最小化。
 
 ### 版本策略
 

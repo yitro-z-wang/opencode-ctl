@@ -40,13 +40,28 @@ URL 作为别名被拒、`OpenCodeError` 类别 → 退出码映射(monkeypatch)
 的 stdin JSON 参数处理,以及凭据不泄露不变量(错误密码与失败的 `password_command`);
 以上均针对一个绑定在 `127.0.0.1` 的一次性 HTTP 服务。
 
+该一次性服务精确复刻 opencode v2 的 `Session.outcome` 语义:没有 running 值,新提示入队时
+不重置,仅在终态转换时与单调递增的 `time.idle` 一起被重写。五个 round-gate(陈旧结果防御)
+场景通过 `POST /__test/complete` 控制端点驱动这一模型:
+
+- 陈旧 succeeded:某轮完成后,新的 `chat` + `wait --timeout` 必须超时(退出 6,
+  `diagnostics.round_gate.watermark_passed == false`),而不是返回上一轮;待该轮真正完成后
+  再成功;
+- 陈旧 failed:上一轮的 `failed` 结果绝不会返回给新一轮;
+- legacy 回退:没有已记录的 `rounds` 行时,`wait` 立即信任原始结果(有文档记载的过渡行为);
+- idle 消息闸门:水印前进但 gate 消息之后没有 `type:"idle"` 消息时仍会超时
+  (`idle_message_seen == false`);
+- `--once`:轮次开放时报告 `status:"running"` + `round_open` + `round_gate`,终态后报告
+  `succeeded` 并关闭该行,使之后的 wait 走 legacy。
+
 ### `live_cli_test.py`
 
 harness(而非 `octl`)在空闲端口上以随机 `OPENCODE_SERVER_PASSWORD` 派生 `opencode serve`,
 等待就绪后把一次性的 `endpoints.toml` 写入临时 `XDG_CONFIG_HOME`,随后驱动常规 agent 循环:
-`doctor` → `create` → `chat`(异步)→ `wait` → `messages --after` → `delete`。每一步都断言退出码
-与 JSON 键,并断言服务密码绝不泄露到 stdout+stderr;`api_version_warning` 存在时被容忍。
-当 `opencode` 不在 `PATH` 上时报告 SKIP。
+`doctor` → `create` → `chat`(异步)→ `wait` → `messages --after` → `delete`。之后运行一次
+两轮冒烟:以唯一标记短语发起第二次 `chat`,可选一次 `--once`,再做阻塞 `wait`,断言返回的是
+第二轮的文本(绝非陈旧的第一轮结果)。每一步都断言退出码与 JSON 键,并断言服务密码绝不泄露到
+stdout+stderr;`api_version_warning` 存在时被容忍。当 `opencode` 不在 `PATH` 上时报告 SKIP。
 
 ## 跳过行为
 
