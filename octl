@@ -428,7 +428,11 @@ def record_round(session_id, watermark, gate_message_id):
 
 
 def lookup_round(session_id):
-    """Return (watermark, gate_message_id) for the session's open round, or None."""
+    """Return the session's open round gate {"watermark", "message_id"}, or None.
+
+    Rows are only written with at least one field set; a both-NULL row (corrupt)
+    degrades to legacy semantics via poll_once's own normalization.
+    """
     try:
         conn = _open_routes()
         try:
@@ -436,7 +440,9 @@ def lookup_round(session_id):
                 "SELECT watermark, gate_message_id FROM rounds WHERE ses = ?",
                 (session_id,),
             ).fetchone()
-            return (row[0], row[1]) if row else None
+            if row is None:
+                return None
+            return {"watermark": row[0], "message_id": row[1]}
         finally:
             conn.close()
     except Exception:
@@ -855,12 +861,7 @@ def cmd_wait(args, config):
     endpoint = resolve_endpoint(args, config, session_id=session_id)
     conn = endpoint.connection()
     record_route(session_id, conn.name)
-    round_row = lookup_round(session_id)
-    round_gate = None
-    if round_row is not None and (
-        round_row[0] is not None or round_row[1] is not None
-    ):
-        round_gate = {"watermark": round_row[0], "message_id": round_row[1]}
+    round_gate = lookup_round(session_id)
     if args.once:
         snapshot = poll_once(
             conn,

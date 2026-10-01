@@ -1120,6 +1120,26 @@ def _result_payload(
     return payload
 
 
+def _idle_message_after(conn, session_id, gate_message_id):
+    """True when a ``type:"idle"`` turn-end message exists after ``gate_message_id``.
+
+    False while the turn is still open, while the enqueued prompt has not been
+    projected as a message yet, or when the fetch fails (fail closed: keep polling).
+    """
+    try:
+        messages = fetch_messages(conn, session_id)
+    except OpenCodeError:
+        messages = []
+    gate_seen = False
+    for message in messages:
+        if not gate_seen:
+            gate_seen = message.get("id") == gate_message_id
+            continue
+        if message.get("type") == "idle":
+            return True
+    return False
+
+
 def poll_once(
     conn,
     session_id,
@@ -1251,34 +1271,20 @@ def poll_once(
     snapshot["outcome"] = outcome
     time_idle = (info.get("time") or {}).get("idle")
 
-    # Round gate (stale-outcome defense). Evaluated before the terminal branch below; the
-    # idle-message confirmation is only fetched once the watermark has advanced, so the
-    # steady-state poll cost is unchanged.
+    # Round gate (stale-outcome defense). A terminal outcome is only real once the idle
+    # watermark advanced AND this round's turn-end "idle" message exists; the message
+    # fetch is deferred until the watermark has advanced, so steady-state polls stay cheap.
     if round_gate is not None:
         watermark = round_gate.get("watermark")
-        rg_message_id = round_gate.get("message_id")
         watermark_passed = watermark is None or (time_idle or 0) > watermark
         idle_message_seen = True
-        if rg_message_id is not None:
-            idle_message_seen = False
-            if watermark_passed:
-                try:
-                    rg_msgs = fetch_messages(conn, session_id)
-                except OpenCodeError:
-                    rg_msgs = []
-                gate_index = None
-                for i, m in enumerate(rg_msgs):
-                    if m.get("id") == rg_message_id:
-                        gate_index = i
-                        break
-                if gate_index is not None:
-                    for m in rg_msgs[gate_index + 1:]:
-                        if m.get("type") == "idle":
-                            idle_message_seen = True
-                            break
+        if round_gate.get("message_id") is not None:
+            idle_message_seen = watermark_passed and _idle_message_after(
+                conn, session_id, round_gate["message_id"]
+            )
         snapshot["round_gate"] = {
             "watermark": watermark,
-            "message_id": rg_message_id,
+            "message_id": round_gate.get("message_id"),
             "time_idle": time_idle,
             "watermark_passed": watermark_passed,
             "idle_message_seen": idle_message_seen,
